@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TPS Backtester</title>
+  <style>html{visibility:hidden}</style>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+</head>
+<body>
+  <!-- Oxford Hub nav — must be first in body -->
+  <script src="https://oxfordhub.app/hub-nav.js" data-project-id="tps-backtester" id="hub-nav"></script>
+
+<!-- ── Header ──────────────────────────────────────────────────────────────── -->
+<header class="header">
+  <div class="header-left">
+    <div class="logo">
+      <span class="logo-icon">◈</span>
+      <span class="logo-text">TPS BACKTESTER</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div id="api-status" class="api-status"></div>
+  </div>
+</header>
+
+<!-- ── Main ──────────────────────────────────────────────────────────────────── -->
+<main class="main">
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="control-group">
+      <label>Ticker</label>
+      <input id="ticker-input" class="ticker-input" type="text" value="SPY" maxlength="10" />
+    </div>
+    <div class="control-group">
+      <label>From</label>
+      <input id="from-date" type="date" />
+    </div>
+    <div class="control-group">
+      <label>To</label>
+      <input id="to-date" type="date" />
+    </div>
+    <div class="control-group">
+      <label>Timeframe</label>
+      <select id="timespan-select">
+        <option value="day" selected>Daily</option>
+        <option value="week">Weekly</option>
+      </select>
+    </div>
+    <button id="run-btn" class="btn btn-primary">Run Backtest</button>
+    <button id="advanced-toggle" class="advanced-toggle">Show Advanced</button>
+
+    <!-- Advanced params (hidden by default) -->
+    <div id="advanced-params" class="advanced-params">
+      <div class="control-group">
+        <label>Min Squeeze Bars</label>
+        <input id="min-squeeze" type="number" value="5" min="1" max="50" style="width:80px" />
+      </div>
+      <div class="control-group">
+        <label>BB Window</label>
+        <input id="bb-window" type="number" value="20" min="5" max="100" style="width:80px" />
+      </div>
+      <div class="control-group">
+        <label>BB Std Dev</label>
+        <input id="bb-std" type="number" value="2.0" min="0.5" max="5" step="0.1" style="width:80px" />
+      </div>
+      <div class="control-group">
+        <label>KC Window</label>
+        <input id="kc-window" type="number" value="20" min="5" max="100" style="width:80px" />
+      </div>
+      <div class="control-group">
+        <label>KC Multiplier</label>
+        <input id="kc-mult" type="number" value="1.5" min="0.5" max="5" step="0.1" style="width:80px" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Error box -->
+  <div id="error-box" class="error-box hidden"></div>
+
+  <!-- Loading state -->
+  <div id="loading" class="loading">
+    <div class="spinner"></div><br />
+    Running TPS analysis…
+  </div>
+
+  <!-- Results -->
+  <div id="results" class="hidden">
+
+    <!-- Stats -->
+    <div id="stats-grid" class="stats-grid"></div>
+
+    <!-- Price chart -->
+    <div class="chart-wrap">
+      <div id="chart-price"></div>
+    </div>
+
+    <!-- Squeeze dots -->
+    <div class="chart-wrap">
+      <div id="chart-squeeze"></div>
+    </div>
+
+    <!-- Momentum histogram -->
+    <div class="chart-wrap">
+      <div id="chart-momentum"></div>
+    </div>
+
+    <!-- Trades table -->
+    <div id="trades-wrap" class="table-wrap"></div>
+
+  </div><!-- /results -->
+
+</main>
+
+<script src="/static/js/app.js"></script>
+<script>
+  // Set default date range (1 year)
+  (function() {
+    const today = new Date();
+    const yearAgo = new Date(today);
+    yearAgo.setFullYear(yearAgo.getFullYear() - 1);
+    document.getElementById("to-date").value   = today.toISOString().slice(0,10);
+    document.getElementById("from-date").value = yearAgo.toISOString().slice(0,10);
+  })();
+</script>
+</body>
+</html>
