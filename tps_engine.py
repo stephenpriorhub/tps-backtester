@@ -26,9 +26,9 @@ ET = pytz.timezone("America/New_York")
 
 DEFAULT_CONFIG = {
     # Strategy params
-    "score_threshold": 65.0,
+    "score_threshold": 50.0,
     "sqz_len": 20,
-    "min_sqz_bars": 3,
+    "min_sqz_bars": 2,
     "max_sqz_bars": 20,
     "release_bars": 3,
     "bb_len": 10,
@@ -182,9 +182,10 @@ def compute_squeeze_states(df: pd.DataFrame, sqz_len: int):
 
     sqz_on_wide   = (lo_bb >= lo_kc_wide)   & (up_bb <= up_kc_wide)
     sqz_on_normal = (lo_bb >= lo_kc_normal) & (up_bb <= up_kc_normal)
-    # NOTE: Pine Script has a likely bug: sqzOnNarrow uses (upBB <= lowKCNarrow)
-    # We replicate it faithfully to match TradingView backtest results.
-    sqz_on_narrow = (lo_bb >= lo_kc_narrow) & (up_bb <= lo_kc_narrow)
+    # NOTE: Previous implementation incorrectly compared upBB to lowKCNarrow.
+    # Pine Script v2 uses (upBB <= upKCNarrow), which is the correct symmetric
+    # definition.  Fixed to match Pine Script exactly.
+    sqz_on_narrow = (lo_bb >= lo_kc_narrow) & (up_bb <= up_kc_narrow)
     sqz_off_wide  = (lo_bb < lo_kc_wide)    & (up_bb > up_kc_wide)
     no_sqz        = ~sqz_on_wide & ~sqz_off_wide
 
@@ -346,10 +347,17 @@ def compute_tps_score(df_chart: pd.DataFrame, config: dict) -> pd.Series:
     Compute the TPS score (0-100) for each bar.
     Assumes df_chart has all signal columns already aligned from each TF:
       d_trend_ok
-      c78_trend_ok,  c78_sqz_tight, c78_sqz_active_or_recent, c78_sqz_bars_ok, c78_sqz_mom_rise2
+      c{chart_tf}_trend_ok,  c{chart_tf}_sqz_tight, c{chart_tf}_sqz_active_or_recent,
+      c{chart_tf}_sqz_bars_ok, c{chart_tf}_sqz_mom_rise2
       c30_trend_ok,  c30_sqz_tight, c30_sqz_active_or_recent, c30_sqz_bars_ok, c30_sqz_mom_rise2
       c15_trend_ok,  c15_sqz_tight, c15_sqz_active_or_recent, c15_sqz_bars_ok, c15_sqz_mom_rise2
+
+    The chart-TF column prefix is derived from config["chart_tf"]
+    (e.g. chart_tf=78 → prefix "c78", chart_tf=195 → prefix "c195").
     """
+    chart_tf  = int(config["chart_tf"])
+    chart_pfx = f"c{chart_tf}"
+
     p_d   = float(config["trend_pts_d"])
     p_78  = float(config["trend_pts_78"])
     p_30  = float(config["trend_pts_30"])
@@ -360,12 +368,12 @@ def compute_tps_score(df_chart: pd.DataFrame, config: dict) -> pd.Series:
 
     c = df_chart
 
-    # Trend score
+    # Trend score — chart-TF column uses the dynamic prefix
     trend_score = (
-        c["d_trend_ok"].astype(float)  * p_d  +
-        c["c78_trend_ok"].astype(float) * p_78 +
-        c["c30_trend_ok"].astype(float) * p_30 +
-        c["c15_trend_ok"].astype(float) * p_15
+        c["d_trend_ok"].astype(float)                    * p_d  +
+        c[f"{chart_pfx}_trend_ok"].astype(float)         * p_78 +
+        c["c30_trend_ok"].astype(float)                  * p_30 +
+        c["c15_trend_ok"].astype(float)                  * p_15
     )
 
     def sqz_score_for_tf(prefix, pts):
@@ -378,7 +386,7 @@ def compute_tps_score(df_chart: pd.DataFrame, config: dict) -> pd.Series:
         )
 
     sqz_score = (
-        sqz_score_for_tf("c78", sp_78) +
+        sqz_score_for_tf(chart_pfx, sp_78) +
         sqz_score_for_tf("c30", sp_30) +
         sqz_score_for_tf("c15", sp_15)
     )
@@ -750,17 +758,32 @@ def run_ticker(ticker: str, df_15m: pd.DataFrame, df_daily: pd.DataFrame,
     # ── 3. Multi-TF alignment onto chart bars
     merged = df_chart_sig.copy()
 
-    # Rename chart-TF signal columns with prefix c78 (or c195)
+    # Rename chart-TF signal columns with prefix c{chart_tf} (e.g. c78, c195)
     tf_name = str(chart_tf)
     for col in ["trend_ok", "sqz_tight", "sqz_active_or_recent", "sqz_bars_ok", "sqz_mom_rise2"]:
         if col in merged.columns:
             merged.rename(columns={col: f"c{tf_name}_{col}"}, inplace=True)
 
-    # Align 30m signals
-    merged = align_tf(merged, df_30_sig, "c30", 30)
+    # Align 30m signals — only if chart TF is higher than 30m to avoid column collision.
+    # When chart_tf == 30, the chart IS the 30m data; copy the chart columns under the
+    # "c30" alias so that compute_tps_score can find them.
+    if chart_tf > 30:
+        merged = align_tf(merged, df_30_sig, "c30", 30)
+    else:
+        # chart_tf <= 30: treat chart columns as the "c30" reference
+        for col in ["trend_ok", "sqz_tight", "sqz_active_or_recent", "sqz_bars_ok", "sqz_mom_rise2"]:
+            src = f"c{tf_name}_{col}"
+            if src in merged.columns:
+                merged[f"c30_{col}"] = merged[src]
 
-    # Align 15m signals
-    merged = align_tf(merged, df_15m_sig, "c15", 15)
+    # Align 15m signals — only if chart TF is higher than 15m
+    if chart_tf > 15:
+        merged = align_tf(merged, df_15m_sig, "c15", 15)
+    else:
+        for col in ["trend_ok", "sqz_tight", "sqz_active_or_recent", "sqz_bars_ok", "sqz_mom_rise2"]:
+            src = f"c{tf_name}_{col}"
+            if src in merged.columns:
+                merged[f"c15_{col}"] = merged[src]
 
     # Align Daily trend
     merged = align_daily(merged, df_daily_sig, "d")

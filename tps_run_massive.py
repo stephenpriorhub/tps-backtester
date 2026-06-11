@@ -36,6 +36,35 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bootstrap: load API key from .env files so standalone `python3 tps_run_massive.py`
+# works without requiring `export MASSIVE_API_KEY=...` in the shell first.
+# tps_app.py (Streamlit) patches MASSIVE_API_KEY separately via _load_api_key();
+# this bootstrap only sets os.environ if neither key is already present.
+# ──────────────────────────────────────────────────────────────────────────────
+def _bootstrap_env():
+    candidates = [
+        Path(__file__).parent / ".env",
+        Path.home() / "Documents/GitHub/trading-scanner/.env",
+        Path.home() / "Documents/github/trading-scanner/.env",
+    ]
+    for p in candidates:
+        if p.exists():
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k in ("MASSIVE_API_KEY", "POLYGON_API_KEY") and not os.environ.get(k):
+                    os.environ[k] = v
+            break  # stop after first found .env
+
+
+_bootstrap_env()
+
 from tps_engine import (
     DEFAULT_CONFIG, filter_market_hours, resample_ohlcv,
     run_ticker, compute_summary, trades_to_dataframe,
@@ -84,7 +113,7 @@ NDX100 = list(dict.fromkeys(NDX100))
 # ★ CONFIG — edit this block to change what the backtest runs
 # ──────────────────────────────────────────────────────────────────────────────
 
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY") or os.environ.get("POLYGON_API_KEY", "")
 MASSIVE_BASE    = "https://api.massive.com"
 
 CONFIG = {
