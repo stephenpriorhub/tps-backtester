@@ -2,8 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
-healthcheckPath = "/api/health"
-healthcheckTimeout = 30
+startCommand = "streamlit run tps_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+healthcheckPath = "/_stcore/health"
 restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
