@@ -200,11 +200,23 @@ with st.sidebar:
 
     # ── Date range
     st.subheader("📅 Date Range")
-    col1, col2 = st.columns(2)
-    start_date = col1.date_input("Start", value=date(2021, 6, 1),
-                                  min_value=date(2021, 6, 1), max_value=date.today())
-    end_date   = col2.date_input("End",   value=date.today(),
-                                  min_value=date(2021, 6, 1), max_value=date.today())
+    _today = date.today()
+    _lookback_opts = {"5 Years": 5, "8 Years": 8, "10 Years": 10, "Custom": None}
+    _lookback_sel = st.radio("Lookback", list(_lookback_opts.keys()), horizontal=True,
+                              index=0, label_visibility="collapsed")
+    _yrs = _lookback_opts[_lookback_sel]
+    _default_start = date(_today.year - _yrs, _today.month, _today.day) if _yrs else date(2021, 6, 1)
+    _min_date = date(2015, 1, 1)
+    if _lookback_sel == "Custom":
+        col1, col2 = st.columns(2)
+        start_date = col1.date_input("Start", value=_default_start,
+                                      min_value=_min_date, max_value=_today)
+        end_date   = col2.date_input("End",   value=_today,
+                                      min_value=_min_date, max_value=_today)
+    else:
+        start_date = _default_start
+        end_date   = _today
+        st.caption(f"{start_date.strftime('%b %d, %Y')}  →  {end_date.strftime('%b %d, %Y')}")
 
     # ── Strategy
     st.subheader("📊 Strategy")

@@ -94,9 +94,10 @@ CONFIG = {
     "tickers": NDX100,
 
     # ── Date range
-    # Note: Massive plan provides intraday data from ~June 2021 forward.
-    # Upgrade at polygon.io/pricing for data back to 2018.
-    "start_date": "2021-06-01",
+    # Polygon.io free tier: data available from ~2016 for daily, ~2021 for 15m intraday.
+    # Paid Starter/Developer plans extend intraday back to 2003.
+    # Default: 10 years back. Set "start_date" in CLI / app to override.
+    "start_date": (datetime.today().replace(year=datetime.today().year - 10)).strftime("%Y-%m-%d"),
     "end_date":   datetime.today().strftime("%Y-%m-%d"),
 
     # ── Chart timeframe: 78 or 195 (minutes)
