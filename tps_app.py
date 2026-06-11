@@ -186,6 +186,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Session state — must initialize before ANY widget reads session_state
+if "results"           not in st.session_state: st.session_state.results           = None
+if "baseline"          not in st.session_state: st.session_state.baseline          = None
+if "cfg_used"          not in st.session_state: st.session_state.cfg_used          = None
+if "saved_test_meta"   not in st.session_state: st.session_state.saved_test_meta   = None
+
 # ── Hub-nav integration
 st.markdown(
     '<script src="https://oxfordhub.app/hub-nav.js" '
@@ -371,12 +377,8 @@ cfg_hash    = _cfg_hash(cfg)
 cached_data = load_cached_results(cfg)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session state
+# Session state  (initialized above after set_page_config)
 # ─────────────────────────────────────────────────────────────────────────────
-
-if "results"           not in st.session_state: st.session_state.results           = None
-if "baseline"          not in st.session_state: st.session_state.baseline          = None
-if "cfg_used"          not in st.session_state: st.session_state.cfg_used          = None
 if "saved_test_meta"   not in st.session_state: st.session_state.saved_test_meta   = None  # metadata when viewing a saved test
 
 # ─────────────────────────────────────────────────────────────────────────────
