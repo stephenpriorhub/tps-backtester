@@ -1,4 +1,12 @@
 .env
-.cache/
+.env.local
 __pycache__/
 *.pyc
+*.pyo
+data/
+results_cache/
+.cache/
+*.log
+*.pkl
+*.parquet
+.streamlit/secrets.toml
