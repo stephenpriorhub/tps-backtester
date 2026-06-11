@@ -9,7 +9,7 @@ Run:
     streamlit run tps_app.py
 """
 
-import os, sys, json, hashlib, pickle, time, tempfile
+import os, sys, json, hashlib, pickle, re, time, tempfile
 from pathlib import Path
 from datetime import date, datetime
 
@@ -51,6 +51,9 @@ _trm.MASSIVE_API_KEY = _load_api_key()
 RESULTS_DIR = PROJECT_DIR / "results_cache"
 RESULTS_DIR.mkdir(exist_ok=True)
 
+SAVED_TESTS_DIR = Path(os.environ.get("SAVED_TESTS_DIR", str(PROJECT_DIR / "saved_tests")))
+SAVED_TESTS_DIR.mkdir(exist_ok=True)
+
 ORIGINAL_9 = ["AAPL", "GOOGL", "NVDA", "TSLA", "AMZN", "MSFT", "AMD", "ORCL", "NFLX"]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +87,39 @@ def save_results(cfg: dict, results: dict):
     p = _results_path(cfg)
     with open(p, "wb") as f:
         pickle.dump(results, f)
+
+
+def save_test(name: str, cfg: dict, results: dict, notes: str = "") -> str:
+    """Save a named test run. Returns the save filename."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:50]
+    ts   = datetime.now().strftime("%Y%m%d_%H%M")
+    fname = f"{ts}_{slug}.pkl"
+    data = {"name": name, "notes": notes, "cfg": cfg, "results": results,
+            "saved_at": datetime.now().isoformat()}
+    with open(SAVED_TESTS_DIR / fname, "wb") as f:
+        pickle.dump(data, f)
+    return fname
+
+
+def list_saved_tests() -> list:
+    """Return list of saved tests sorted newest first."""
+    tests = []
+    for p in sorted(SAVED_TESTS_DIR.glob("*.pkl"), reverse=True):
+        try:
+            with open(p, "rb") as f:
+                d = pickle.load(f)
+            tests.append({"fname": p.name, "name": d.get("name", ""),
+                          "notes": d.get("notes", ""), "saved_at": d.get("saved_at", ""),
+                          "cfg": d.get("cfg", {})})
+        except Exception:
+            pass
+    return tests
+
+
+def load_saved_test(fname: str) -> dict:
+    """Load a saved test by filename."""
+    with open(SAVED_TESTS_DIR / fname, "rb") as f:
+        return pickle.load(f)
 
 
 def ticker_stats(ticker: str, df_trades: pd.DataFrame) -> dict:
@@ -260,6 +296,42 @@ with st.sidebar:
     save_btn = st.button("📌 Save as Baseline", use_container_width=True)
     st.divider()
 
+    # ── Saved Tests
+    with st.expander("💾 Saved Tests"):
+        st.markdown("**Save current results**")
+        _save_name  = st.text_input("Test name", placeholder="e.g. 8yr 195m high-score")
+        _save_notes = st.text_area("Notes (optional)", height=60)
+        _can_save   = st.session_state.results is not None and bool(_save_name.strip())
+        if st.button("💾 Save current results", disabled=not _can_save,
+                     use_container_width=True):
+            _fname = save_test(
+                name=_save_name.strip(),
+                cfg=st.session_state.cfg_used or cfg,
+                results=st.session_state.results,
+                notes=_save_notes.strip(),
+            )
+            st.toast(f"Saved as {_fname}", icon="💾")
+
+        st.markdown("---")
+        st.markdown("**Load a saved test**")
+        _saved_list = list_saved_tests()
+        if not _saved_list:
+            st.caption("No saved tests yet.")
+        else:
+            _saved_options = {
+                f"{t['name']}  ({t['saved_at'][:16]})": t["fname"]
+                for t in _saved_list
+            }
+            _sel_label = st.selectbox("Select saved test", list(_saved_options.keys()),
+                                      label_visibility="collapsed")
+            if st.button("📂 Load", use_container_width=True):
+                _loaded = load_saved_test(_saved_options[_sel_label])
+                st.session_state.results         = _loaded["results"]
+                st.session_state.cfg_used        = _loaded["cfg"]
+                st.session_state.saved_test_meta = _loaded
+                st.toast(f"Loaded: {_loaded['name']}", icon="📂")
+                st.rerun()
+
     # ── API key status
     if _trm.MASSIVE_API_KEY:
         st.success("API key ✓", icon="🔑")
@@ -302,9 +374,10 @@ cached_data = load_cached_results(cfg)
 # Session state
 # ─────────────────────────────────────────────────────────────────────────────
 
-if "results"  not in st.session_state: st.session_state.results  = None
-if "baseline" not in st.session_state: st.session_state.baseline = None
-if "cfg_used" not in st.session_state: st.session_state.cfg_used = None
+if "results"           not in st.session_state: st.session_state.results           = None
+if "baseline"          not in st.session_state: st.session_state.baseline          = None
+if "cfg_used"          not in st.session_state: st.session_state.cfg_used          = None
+if "saved_test_meta"   not in st.session_state: st.session_state.saved_test_meta   = None  # metadata when viewing a saved test
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
@@ -320,14 +393,35 @@ st.caption(cfg_label)
 cache_status = "💾 Cached result available" if cached_data else "🔄 Not yet run with these parameters"
 st.caption(f"Config hash: `{cfg_hash}` — {cache_status}")
 
+# ── Saved-test banner
+if st.session_state.saved_test_meta is not None:
+    _stm = st.session_state.saved_test_meta
+    _saved_date_str = _stm.get("saved_at", "")[:10]
+    try:
+        _saved_date_str = datetime.fromisoformat(_stm["saved_at"]).strftime("%b %d %Y")
+    except Exception:
+        pass
+    _stm_cfg = _stm.get("cfg", {})
+    _stm_tickers = _stm_cfg.get("tickers", [])
+    _stm_tf = _stm_cfg.get("chart_tf", "?")
+    _stm_start = _stm_cfg.get("start_date", "?")
+    _stm_end   = _stm_cfg.get("end_date", "?")
+    st.info(
+        f"📂 Viewing saved test: **\"{_stm['name']}\"** — saved {_saved_date_str}  |  "
+        f"{len(_stm_tickers)} tickers  ·  {_stm_tf}m  ·  {_stm_start} → {_stm_end}"
+        + (f"  |  _{_stm['notes']}_" if _stm.get("notes") else ""),
+        icon=None,
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Run backtest
 # ─────────────────────────────────────────────────────────────────────────────
 
 if run_btn:
     if cached_data:
-        st.session_state.results  = cached_data
-        st.session_state.cfg_used = cfg
+        st.session_state.results         = cached_data
+        st.session_state.cfg_used        = cfg
+        st.session_state.saved_test_meta = None
         st.toast("Loaded from cache — instant!", icon="⚡")
     else:
         if not _trm.MASSIVE_API_KEY:
@@ -349,8 +443,9 @@ if run_btn:
 
         all_trades = run_backtest(tickers, cfg, _progress)
         save_results(cfg, all_trades)
-        st.session_state.results  = all_trades
-        st.session_state.cfg_used = cfg
+        st.session_state.results         = all_trades
+        st.session_state.cfg_used        = cfg
+        st.session_state.saved_test_meta = None
 
         progress_bar.empty()
         status_text.empty()

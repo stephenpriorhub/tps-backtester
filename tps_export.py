@@ -11,30 +11,28 @@ Public API
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 import openpyxl
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, numbers
+from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 # ── Reference ticker order (Summary sheet columns B–J) ────────────────────────
 REFERENCE_TICKERS = ["AAPL", "GOOGL", "NVDA", "TSLA", "AMZN", "MSFT", "AMD", "ORCL", "NFLX"]
 
 # ── Number formats ─────────────────────────────────────────────────────────────
-FMT_PCT          = "0.00%"
-FMT_DECIMAL      = "0.00"
-FMT_ACCOUNTING   = r'_(* #,##0.00_);_(* \(#,##0.00\);_(* "-"??_);_(@_)'
-FMT_PCT3         = "0.000%"
-FMT_DATETIME     = r'yyyy\-mm\-dd\ hh:mm'
-FMT_GENERAL      = "General"
+FMT_PCT       = "0.00%"
+FMT_PCT3      = "0.000%"
+FMT_DECIMAL   = "0.00"
+FMT_DATETIME  = r'yyyy\-mm\-dd\ hh:mm'
+FMT_NUMBER    = "#,##0.00"
 
 # ── Fonts ──────────────────────────────────────────────────────────────────────
-FONT_NORMAL  = Font(name="Calibri", size=11)
-FONT_BOLD    = Font(name="Calibri", size=11, bold=True)
+FONT_NORMAL = Font(name="Calibri", size=11)
+FONT_BOLD   = Font(name="Calibri", size=11, bold=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -42,7 +40,6 @@ FONT_BOLD    = Font(name="Calibri", size=11, bold=True)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _col_letter(col_idx: int) -> str:
-    """1-based column index → Excel letter (A, B, … Z, AA, …)."""
     return get_column_letter(col_idx)
 
 
@@ -50,15 +47,11 @@ def _set_cell(ws, row: int, col: int, value, fmt: str = None, bold: bool = False
     cell = ws.cell(row=row, column=col, value=value)
     if fmt:
         cell.number_format = fmt
-    if bold:
-        cell.font = FONT_BOLD
-    else:
-        cell.font = FONT_NORMAL
+    cell.font = FONT_BOLD if bold else FONT_NORMAL
     return cell
 
 
 def _auto_width(ws, min_width: int = 8, max_width: int = 30, overrides: dict = None):
-    """Set column widths based on content; overrides is {col_letter: width}."""
     overrides = overrides or {}
     for col in ws.columns:
         letter = col[0].column_letter
@@ -70,35 +63,29 @@ def _auto_width(ws, min_width: int = 8, max_width: int = 30, overrides: dict = N
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY SHEET  ("195min Summary" or "{chart_tf}min Summary")
+# SUMMARY SHEET
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _write_summary_sheet(wb: Workbook, all_trades: Dict[str, pd.DataFrame],
-                          tickers: list[str], chart_tf: int) -> None:
+def _write_summary_sheet(wb: Workbook, tickers: list, chart_tf: int) -> None:
     """
-    Build the Summary sheet with Excel formulas referencing individual ticker sheets.
-    Layout matches the exact specification: 13 rows × 12 cols (A–L).
+    Build the Summary sheet with Excel INDIRECT formulas referencing ticker sheets.
+    Layout: 13 rows × (2 + n_tickers + 1) columns
+    Row 1: blank A1, ticker names in B..., "V2 (tf)avgs" in last col
+    Rows 2–11: metric labels in A, INDIRECT formulas per ticker, AVERAGE/SUM in avgs col
+    Row 13: footer with avg-days-in and exp/day calculations
     """
     sheet_name = f"{chart_tf}min Summary"
-    ws = wb.create_sheet(sheet_name, 0)  # insert at front
+    ws = wb.create_sheet(sheet_name, 0)
 
-    # ── Row 1 headers ──────────────────────────────────────────────────────────
-    # Col A: empty; B–K: tickers; K last ticker is "V2 ({chart_tf})avgs"
-    # We'll put tickers in B..B+n-1, then the avgs column right after.
     n = len(tickers)
-    avgs_col = n + 2  # col index of the "V2 avgs" column (1-based, A=1, B=2)
+    avgs_col = n + 2  # 1-based; A=1, tickers in cols 2..n+1, avgs in col n+2
 
-    # Col A row 1 empty
-    _set_cell(ws, 1, 1, None)
-
+    # ── Row 1: headers
     for i, ticker in enumerate(tickers):
-        col = i + 2  # B = 2
-        _set_cell(ws, 1, col, ticker, bold=True)
-
-    # Avgs column header
+        _set_cell(ws, 1, i + 2, ticker, bold=True)
     _set_cell(ws, 1, avgs_col, f"V2 ({chart_tf})avgs", bold=True)
 
-    # ── Row 2–11: Metric rows ──────────────────────────────────────────────────
+    # ── Row 2–11: metric labels
     metric_labels = [
         "Count",
         "# Wins",
@@ -111,35 +98,27 @@ def _write_summary_sheet(wb: Workbook, all_trades: Dict[str, pd.DataFrame],
         "Expectancy:",
         "Avg Duration (days)",
     ]
+    for offset, label in enumerate(metric_labels):
+        _set_cell(ws, offset + 2, 1, label, bold=True)
 
-    for row_offset, label in enumerate(metric_labels):
-        row = row_offset + 2  # rows 2..11
-        _set_cell(ws, row, 1, label, bold=True)
-
-    # ── Per-ticker formulas ────────────────────────────────────────────────────
+    # ── Per-ticker INDIRECT formulas
     for i, ticker in enumerate(tickers):
-        col = i + 2  # B=2, C=3 …
+        col = i + 2
         cl = _col_letter(col)
-
-        # Sanitize ticker name for sheet references (tickers with . may need quoting)
-        # Sheet names with special chars need single-quoting in INDIRECT
-        safe = ticker  # sheet name is same as ticker
 
         # Row 2: Count = MAX(A:A)/2
         _set_cell(ws, 2, col,
                   f"=MAX(INDIRECT(\"'\"&{cl}$1&\"'!A:A\"))/2",
-                  fmt=FMT_ACCOUNTING)
+                  fmt=FMT_NUMBER)
 
         # Row 3: # Wins = COUNTIF(H:H, ">0")
         _set_cell(ws, 3, col,
                   f"=COUNTIF(INDIRECT({cl}$1&\"!H:H\"),\">0\")",
-                  fmt=FMT_ACCOUNTING)
+                  fmt=FMT_NUMBER)
 
-        # Row 4: Win Rate = B3/B2
-        row2_ref = f"{cl}2"
-        row3_ref = f"{cl}3"
+        # Row 4: Win Rate
         _set_cell(ws, 4, col,
-                  f"=IFERROR({row3_ref}/{row2_ref},0)",
+                  f"=IFERROR({cl}3/{cl}2,0)",
                   fmt=FMT_PCT)
 
         # Row 5: Avg Return %
@@ -164,10 +143,11 @@ def _write_summary_sheet(wb: Workbook, all_trades: Dict[str, pd.DataFrame],
 
         # Row 9: Win Rate (max)
         _set_cell(ws, 9, col,
-                  f"=IFERROR(COUNTIF(INDIRECT({cl}$1&\"!I:I\"),\">0\")/COUNT(INDIRECT({cl}$1&\"!I:I\")),0)",
+                  f"=IFERROR(COUNTIF(INDIRECT({cl}$1&\"!I:I\"),\">0\")"
+                  f"/COUNT(INDIRECT({cl}$1&\"!I:I\")),0)",
                   fmt=FMT_PCT)
 
-        # Row 10: Expectancy = (WR * AvgWin) + (1-WR) * AvgLoss
+        # Row 10: Expectancy = WR * AvgWin + (1-WR) * AvgLoss
         _set_cell(ws, 10, col,
                   f"=IFERROR(({cl}4*{cl}6+(1-{cl}4)*{cl}7),0)",
                   fmt=FMT_PCT)
@@ -175,88 +155,72 @@ def _write_summary_sheet(wb: Workbook, all_trades: Dict[str, pd.DataFrame],
         # Row 11: Avg Duration (days)
         _set_cell(ws, 11, col,
                   f"=IFERROR(AVERAGE(INDIRECT({cl}$1&\"!L:L\")),0)",
-                  fmt=FMT_ACCOUNTING)
+                  fmt=FMT_NUMBER)
 
-    # ── Avgs column (K in reference, but dynamically placed) ──────────────────
+    # ── Avgs column
     avgs_cl = _col_letter(avgs_col)
-    first_ticker_cl = "B"
-    last_ticker_cl  = _col_letter(n + 1)  # last ticker col
+    first_cl = "B"
+    last_cl  = _col_letter(n + 1)
 
-    # Row 2: SUM
-    _set_cell(ws, 2, avgs_col,
-              f"=SUM({first_ticker_cl}2:{last_ticker_cl}2)",
-              fmt=FMT_ACCOUNTING)
+    _set_cell(ws, 2,  avgs_col, f"=SUM({first_cl}2:{last_cl}2)",   fmt=FMT_NUMBER)
+    _set_cell(ws, 3,  avgs_col, f"=SUM({first_cl}3:{last_cl}3)",   fmt=FMT_NUMBER)
+    _set_cell(ws, 4,  avgs_col, f"=AVERAGE({first_cl}4:{last_cl}4)", fmt=FMT_PCT)
+    _set_cell(ws, 5,  avgs_col, f"=AVERAGE({first_cl}5:{last_cl}5)", fmt=FMT_PCT)
+    _set_cell(ws, 6,  avgs_col, f"=AVERAGE({first_cl}6:{last_cl}6)", fmt=FMT_PCT)
+    _set_cell(ws, 7,  avgs_col, f"=AVERAGE({first_cl}7:{last_cl}7)", fmt=FMT_PCT)
+    _set_cell(ws, 8,  avgs_col, f"=AVERAGE({first_cl}8:{last_cl}8)", fmt=FMT_PCT)
+    _set_cell(ws, 9,  avgs_col, f"=AVERAGE({first_cl}9:{last_cl}9)", fmt=FMT_PCT)
+    _set_cell(ws, 10, avgs_col, f"=AVERAGE({first_cl}10:{last_cl}10)", fmt=FMT_PCT)
+    _set_cell(ws, 11, avgs_col, f"=AVERAGE({first_cl}11:{last_cl}11)", fmt=FMT_NUMBER)
 
-    # Row 3: SUM
-    _set_cell(ws, 3, avgs_col,
-              f"=SUM({first_ticker_cl}3:{last_ticker_cl}3)",
-              fmt=FMT_ACCOUNTING)
+    # ── Row 13: footer
+    # Reference: I13="avg days in", J13=K11/2, K13=K10/J13, L13="exp / day"
+    # In our layout: (avgs_col-2), (avgs_col-1), avgs_col, (avgs_col+1)
+    col_i = avgs_col - 2
+    col_j = avgs_col - 1
+    col_k = avgs_col
+    col_l = avgs_col + 1
 
-    # Rows 4–10: AVERAGE
-    avg_rows = [(4, FMT_PCT), (5, FMT_PCT), (6, FMT_PCT), (7, FMT_PCT),
-                (8, FMT_PCT), (9, FMT_PCT), (10, FMT_PCT)]
-    for row, fmt in avg_rows:
-        _set_cell(ws, row, avgs_col,
-                  f"=AVERAGE({first_ticker_cl}{row}:{last_ticker_cl}{row})",
-                  fmt=fmt)
+    j_cl = _col_letter(col_j)
 
-    # Row 11: AVERAGE (accounting)
-    _set_cell(ws, 11, avgs_col,
-              f"=AVERAGE({first_ticker_cl}11:{last_ticker_cl}11)",
-              fmt=FMT_ACCOUNTING)
-
-    # ── Row 12: Empty ──────────────────────────────────────────────────────────
-    # (nothing to write)
-
-    # ── Row 13: Footer ────────────────────────────────────────────────────────
-    # Reference spec: I13="avg days in", J13=K11/2, K13=K10/J13, L13="exp / day"
-    # We map those to columns relative to our layout:
-    #   "I" = avgs_col - 2, "J" = avgs_col - 1, "K" = avgs_col, "L" = avgs_col + 1
-    col_i13 = avgs_col - 2
-    col_j13 = avgs_col - 1
-    col_k13 = avgs_col
-    col_l13 = avgs_col + 1
-
-    _set_cell(ws, 13, col_i13, "avg days in")
-    _set_cell(ws, 13, col_j13,
+    _set_cell(ws, 13, col_i, "avg days in")
+    _set_cell(ws, 13, col_j,
               f"={avgs_cl}11/2",
-              fmt=FMT_ACCOUNTING)
-    j13_cl = _col_letter(col_j13)
-    _set_cell(ws, 13, col_k13,
-              f"=IFERROR({avgs_cl}10/{j13_cl}13,0)",
+              fmt=FMT_NUMBER)
+    _set_cell(ws, 13, col_k,
+              f"=IFERROR({avgs_cl}10/{j_cl}13,0)",
               fmt=FMT_PCT3)
-    _set_cell(ws, 13, col_l13, "exp / day")
+    _set_cell(ws, 13, col_l, "exp / day")
 
-    # ── Column widths ──────────────────────────────────────────────────────────
-    _auto_width(ws, overrides={avgs_cl: 11.2})
+    # ── Column widths
+    _auto_width(ws, overrides={"A": 18})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TICKER SHEET
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Column definitions in reference order (A=1 … T=20)
-# Index = col number (1-based)
-COL_TRADE_NUM      = 1   # A  Trade #
-COL_TYPE           = 2   # B  Type
-COL_DATETIME       = 3   # C  Date and time
-COL_SIGNAL         = 4   # D  Signal
-COL_PRICE          = 5   # E  Price USD
-COL_SIZE_QTY       = 6   # F  Size (qty)
-COL_SIZE_VAL       = 7   # G  Size (value)
-COL_TOTAL_RETURN   = 8   # H  Total Return
-COL_MAX_RETURN     = 9   # I  Max Return
-COL_STATS_J        = 10  # J  (no header — stats)
-COL_STATS_K        = 11  # K  (no header — stats)
-COL_DURATION       = 12  # L  Duration
-COL_NET_PNL_USD    = 13  # M  Net P&L USD
-COL_NET_PNL_PCT    = 14  # N  Net P&L %
-COL_FAV_EXC_USD    = 15  # O  Favorable excursion USD
-COL_FAV_EXC_PCT    = 16  # P  Favorable excursion %
-COL_ADV_EXC_USD    = 17  # Q  Adverse excursion USD
-COL_ADV_EXC_PCT    = 18  # R  Adverse excursion %
-COL_CUM_PNL_USD    = 19  # S  Cumulative P&L USD
-COL_CUM_PNL_PCT    = 20  # T  Cumulative P&L %
+# Column indices (1-based)
+COL_TRADE_NUM    = 1   # A  Trade #
+COL_TYPE         = 2   # B  Type
+COL_DATETIME     = 3   # C  Date and time
+COL_SIGNAL       = 4   # D  Signal
+COL_PRICE        = 5   # E  Price USD
+COL_SIZE_QTY     = 6   # F  Size (qty)
+COL_SIZE_VAL     = 7   # G  Size (value)
+COL_TOTAL_RETURN = 8   # H  Total Return
+COL_MAX_RETURN   = 9   # I  Max Return
+COL_STATS_J      = 10  # J  (no header)
+COL_STATS_K      = 11  # K  (no header)
+COL_DURATION     = 12  # L  Duration
+COL_NET_PNL_USD  = 13  # M  Net P&L USD
+COL_NET_PNL_PCT  = 14  # N  Net P&L %
+COL_FAV_EXC_USD  = 15  # O  Favorable excursion USD
+COL_FAV_EXC_PCT  = 16  # P  Favorable excursion %
+COL_ADV_EXC_USD  = 17  # Q  Adverse excursion USD
+COL_ADV_EXC_PCT  = 18  # R  Adverse excursion %
+COL_CUM_PNL_USD  = 19  # S  Cumulative P&L USD
+COL_CUM_PNL_PCT  = 20  # T  Cumulative P&L %
 
 TICKER_HEADERS = {
     COL_TRADE_NUM:    "Trade #",
@@ -268,8 +232,8 @@ TICKER_HEADERS = {
     COL_SIZE_VAL:     "Size (value)",
     COL_TOTAL_RETURN: "Total Return",
     COL_MAX_RETURN:   "Max Return",
-    COL_STATS_J:      None,   # no header
-    COL_STATS_K:      None,   # no header
+    COL_STATS_J:      None,
+    COL_STATS_K:      None,
     COL_DURATION:     "Duration",
     COL_NET_PNL_USD:  "Net P&L USD",
     COL_NET_PNL_PCT:  "Net P&L %",
@@ -284,191 +248,359 @@ TICKER_HEADERS = {
 
 def _write_ticker_sheet(wb: Workbook, ticker: str, df: pd.DataFrame) -> None:
     """
-    Write one ticker sheet with the exact 20-column layout from the reference.
+    Write one ticker sheet with the exact 20-column reference layout.
 
-    df must be the output of tps_engine.trades_to_dataframe() — which produces
-    pairs of (Entry long / Exit long) rows per signal.
+    Reference 4-row block per signal:
+        Row 1: Trade N   | Entry long | entry_date | Long  | entry_price | ...
+        Row 2: Trade N+1 | Entry long | entry_date | Long  | entry_price | ...
+        Row 3: Trade N   | Exit long  | exit_date  | TP1   | exit_price  | ... (H blank)
+        Row 4: Trade N+1 | Exit long  | exit_date  | TP2   | exit_price  | ... (H formula fires)
 
-    The reference uses 4-row blocks per trade:
-        Entry long TP1 (trade N)
-        Entry long TP2 (trade N+1)
-        Exit long TP1  (trade N, signal TP1)
-        Exit long TP2  (trade N+1, signal TP2)
+    Column H fires on row 4 (TP2 exit):
+        =IF(AND(D4<>"TP1", B4="Exit long", A4=A2), AVERAGE(N3:N4)/100, "")
+    Column I fires on row 4:
+        =IF(AND(D4<>"TP1", B4="Exit long", A4=A2), ((E2+O4)/E2)-1, "")
+    Column L fires on row 4:
+        =IF(I4<>"", _xlfn.DAYS(C4, C2), "")
 
-    tps_engine.trades_to_dataframe() already outputs rows in this order
-    with sequentially numbered trade IDs. We use it directly.
+    In-sheet aggregate formulas (no header columns J, K):
+        J2 = COUNTIF(H:H,">0")/COUNT(H:H)   — win rate by Total Return
+        K2 = COUNTIF(I:I,">0")/COUNT(I:I)   — win rate by Max Return
+        J4 = AVERAGE(H:H)
+        K4 = AVERAGE(I:I)
     """
     ws = wb.create_sheet(ticker)
 
-    # ── Row 1: Headers ─────────────────────────────────────────────────────────
+    # ── Row 1: Headers
     for col_idx, header in TICKER_HEADERS.items():
         if header is not None:
             _set_cell(ws, 1, col_idx, header, bold=True)
 
-    # ── In-sheet aggregate stats in J2, K2, J4, K4 (no IFERROR, matching reference) ──
-    ws.cell(row=2, column=COL_STATS_J).value  = "=COUNTIF(H:H,\">0\")/COUNT(H:H)"
+    # ── In-sheet aggregate stats: J2, K2, J4, K4
+    ws.cell(row=2, column=COL_STATS_J).value = "=COUNTIF(H:H,\">0\")/COUNT(H:H)"
     ws.cell(row=2, column=COL_STATS_J).number_format = FMT_PCT
-    ws.cell(row=2, column=COL_STATS_K).value  = "=COUNTIF(I:I,\">0\")/COUNT(I:I)"
+    ws.cell(row=2, column=COL_STATS_K).value = "=COUNTIF(I:I,\">0\")/COUNT(I:I)"
     ws.cell(row=2, column=COL_STATS_K).number_format = FMT_PCT
-    ws.cell(row=4, column=COL_STATS_J).value  = "=AVERAGE(H:H)"
+    ws.cell(row=4, column=COL_STATS_J).value = "=AVERAGE(H:H)"
     ws.cell(row=4, column=COL_STATS_J).number_format = FMT_PCT
-    ws.cell(row=4, column=COL_STATS_K).value  = "=AVERAGE(I:I)"
+    ws.cell(row=4, column=COL_STATS_K).value = "=AVERAGE(I:I)"
     ws.cell(row=4, column=COL_STATS_K).number_format = FMT_PCT
 
     if df is None or df.empty:
         ws.freeze_panes = "A2"
         return
 
-    # ── Rebuild df into exact 4-row-block structure ────────────────────────────
-    # tps_engine.trades_to_dataframe already produces:
-    #   Trade N  Entry long (TP1 leg)
-    #   Trade N  Exit long  (TP1 leg)
-    #   Trade N+1 Entry long (TP2 leg)
-    #   Trade N+1 Exit long  (TP2 leg)
-    # BUT the reference wants them reordered as:
-    #   Trade N   Entry long TP1
-    #   Trade N+1 Entry long TP2
-    #   Trade N   Exit long TP1
-    #   Trade N+1 Exit long TP2
-    # We need to reconstruct this 4-row block order.
+    # ── Build 4-row blocks from engine output
+    blocks = _build_signal_blocks(df)
 
-    rows_out = _build_4row_blocks(df)
+    # ── Write rows
+    cum_pnl_usd = 0.0
+    cum_pnl_pct = 0.0
 
-    # ── Write data rows ────────────────────────────────────────────────────────
-    for i, row_data in enumerate(rows_out):
-        excel_row = i + 2  # row 1 = header
+    for signal_idx, block in enumerate(blocks):
+        # signal_idx 0-based; trade numbers for TP1 = 2*signal_idx+1, TP2 = 2*signal_idx+2
+        tp1_trade_num = 2 * signal_idx + 1
+        tp2_trade_num = 2 * signal_idx + 2
 
-        # Standard columns with simple values
-        _set_cell(ws, excel_row, COL_TRADE_NUM, row_data.get("Trade #"))
-        _set_cell(ws, excel_row, COL_TYPE,      row_data.get("Type"))
+        # Excel row numbers (1-based; row 1 = header)
+        # Block occupies 4 rows: entry_tp1, entry_tp2, exit_tp1, exit_tp2
+        base_row = 2 + signal_idx * 4  # row of Entry TP1
 
-        # Date/time — write as string (already formatted)
-        dt_val = row_data.get("Date and time")
-        _set_cell(ws, excel_row, COL_DATETIME, dt_val, fmt=FMT_DATETIME)
+        entry_tp1_row = base_row
+        entry_tp2_row = base_row + 1
+        exit_tp1_row  = base_row + 2
+        exit_tp2_row  = base_row + 3
 
-        _set_cell(ws, excel_row, COL_SIGNAL,   row_data.get("Signal"))
-        _set_cell(ws, excel_row, COL_PRICE,    row_data.get("Price USD"))
-        _set_cell(ws, excel_row, COL_SIZE_QTY, row_data.get("Size (qty)"))
-        _set_cell(ws, excel_row, COL_SIZE_VAL, row_data.get("Size (value)"))
+        entry = block["entry"]
+        exit_tp1 = block["exit_tp1"]
+        exit_tp2 = block["exit_tp2"]
 
-        # H, I, L — reference pattern: every row from row 3 onward gets formulas
-        # (row 2 = first entry, never gets formulas)
-        # Formula references row n and row n-2 (two rows back)
-        if excel_row >= 3:
-            n = excel_row
-            h_formula = (
-                f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-                f'AVERAGE(N{n-1}:N{n})/100,"")'
-            )
-            i_formula = (
-                f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-                f'((E{n-2}+O{n})/E{n-2})-1,"")'
-            )
-            l_formula = f'=IF(I{n}<>"",_xlfn.DAYS(C{n},C{n-2}),"")'
+        entry_price   = entry["entry_price"]
+        exit_tp1_price = exit_tp1["exit_price"]
+        exit_tp2_price = exit_tp2["exit_price"]
 
-            c = ws.cell(row=excel_row, column=COL_TOTAL_RETURN, value=h_formula)
-            c.number_format = FMT_PCT
-            c = ws.cell(row=excel_row, column=COL_MAX_RETURN, value=i_formula)
-            c.number_format = FMT_PCT
-            c = ws.cell(row=excel_row, column=COL_DURATION, value=l_formula)
-            c.number_format = FMT_DECIMAL
+        tp1_pnl_pct = (exit_tp1_price - entry_price) / entry_price * 100
+        tp2_pnl_pct = (exit_tp2_price - entry_price) / entry_price * 100
+        tp1_pnl_usd = round(exit_tp1_price - entry_price, 2)
+        tp2_pnl_usd = round(exit_tp2_price - entry_price, 2)
 
-        # M–T: data values
-        _set_cell(ws, excel_row, COL_NET_PNL_USD,  row_data.get("Net P&L USD"))
-        _set_cell(ws, excel_row, COL_NET_PNL_PCT,  row_data.get("Net P&L %"),     fmt=FMT_DECIMAL)
-        _set_cell(ws, excel_row, COL_FAV_EXC_USD,  row_data.get("Favorable excursion USD"))
-        _set_cell(ws, excel_row, COL_FAV_EXC_PCT,  row_data.get("Favorable excursion %"),  fmt=FMT_DECIMAL)
-        _set_cell(ws, excel_row, COL_ADV_EXC_USD,  row_data.get("Adverse excursion USD"))
-        _set_cell(ws, excel_row, COL_ADV_EXC_PCT,  row_data.get("Adverse excursion %"),    fmt=FMT_DECIMAL)
-        _set_cell(ws, excel_row, COL_CUM_PNL_USD,  row_data.get("Cumulative P&L USD"))
-        _set_cell(ws, excel_row, COL_CUM_PNL_PCT,  row_data.get("Cumulative P&L %"),       fmt=FMT_DECIMAL)
+        tp1_fav_usd = round(exit_tp1["fav_exc_pct"] / 100 * entry_price, 2)
+        tp1_fav_pct = exit_tp1["fav_exc_pct"]
+        tp1_adv_usd = round(exit_tp1["adv_exc_pct"] / 100 * entry_price, 2)
+        tp1_adv_pct = exit_tp1["adv_exc_pct"]
 
-    # ── Format header row datetime column ─────────────────────────────────────
-    ws.cell(row=1, column=COL_TOTAL_RETURN).number_format = FMT_PCT
+        tp2_fav_usd = round(exit_tp2["fav_exc_pct"] / 100 * entry_price, 2)
+        tp2_fav_pct = exit_tp2["fav_exc_pct"]
+        tp2_adv_usd = round(exit_tp2["adv_exc_pct"] / 100 * entry_price, 2)
+        tp2_adv_pct = exit_tp2["adv_exc_pct"]
 
-    # ── Freeze header row ─────────────────────────────────────────────────────
+        cum_pnl_usd += tp1_pnl_usd + tp2_pnl_usd
+        cum_pnl_pct += tp1_pnl_pct + tp2_pnl_pct
+
+        # Format datetimes
+        entry_dt_str = entry["entry_time_str"]
+        exit_tp1_dt_str = exit_tp1["exit_time_str"]
+        exit_tp2_dt_str = exit_tp2["exit_time_str"]
+
+        # Determine exit signal labels
+        tp1_signal = _exit_signal_label(exit_tp1["exit_type"], "TP1")
+        tp2_signal = _exit_signal_label(exit_tp2["exit_type"], "TP2")
+
+        # ── Row: Entry TP1 (trade N)
+        _write_data_row(ws, entry_tp1_row,
+                        trade_num=tp1_trade_num,
+                        row_type="Entry long",
+                        dt_str=entry_dt_str,
+                        signal="Long",
+                        price=entry_price,
+                        size_qty=1,
+                        size_val=entry_price,
+                        net_pnl_usd=tp1_pnl_usd,
+                        net_pnl_pct=tp1_pnl_pct,
+                        fav_exc_usd=tp1_fav_usd,
+                        fav_exc_pct=tp1_fav_pct,
+                        adv_exc_usd=tp1_adv_usd,
+                        adv_exc_pct=tp1_adv_pct,
+                        cum_pnl_usd=None,
+                        cum_pnl_pct=None)
+
+        # ── Row: Entry TP2 (trade N+1)
+        _write_data_row(ws, entry_tp2_row,
+                        trade_num=tp2_trade_num,
+                        row_type="Entry long",
+                        dt_str=entry_dt_str,
+                        signal="Long",
+                        price=entry_price,
+                        size_qty=1,
+                        size_val=entry_price,
+                        net_pnl_usd=tp2_pnl_usd,
+                        net_pnl_pct=tp2_pnl_pct,
+                        fav_exc_usd=tp2_fav_usd,
+                        fav_exc_pct=tp2_fav_pct,
+                        adv_exc_usd=tp2_adv_usd,
+                        adv_exc_pct=tp2_adv_pct,
+                        cum_pnl_usd=None,
+                        cum_pnl_pct=None)
+
+        # ── Row: Exit TP1 (trade N)
+        # H is blank on TP1 exit rows (the IF condition D<>"TP1" fails)
+        # But we still write the formula — it evaluates to "" because D="TP1"
+        _write_data_row(ws, exit_tp1_row,
+                        trade_num=tp1_trade_num,
+                        row_type="Exit long",
+                        dt_str=exit_tp1_dt_str,
+                        signal=tp1_signal,
+                        price=exit_tp1_price,
+                        size_qty=1,
+                        size_val=entry_price,
+                        net_pnl_usd=tp1_pnl_usd,
+                        net_pnl_pct=tp1_pnl_pct,
+                        fav_exc_usd=tp1_fav_usd,
+                        fav_exc_pct=tp1_fav_pct,
+                        adv_exc_usd=tp1_adv_usd,
+                        adv_exc_pct=tp1_adv_pct,
+                        cum_pnl_usd=round(cum_pnl_usd - tp2_pnl_usd, 2),
+                        cum_pnl_pct=round(cum_pnl_pct - tp2_pnl_pct, 4))
+
+        # Write H/I/L formulas for exit_tp1_row
+        # H fires on TP2 exit only (D="TP1" here so condition fails, evaluates to "")
+        n = exit_tp1_row
+        h_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
+               f'AVERAGE(N{n-1}:N{n})/100,"")')
+        i_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
+               f'((E{n-2}+O{n})/E{n-2})-1,"")')
+        l_f = f'=IF(I{n}<>"",_xlfn.DAYS(C{n},C{n-2}),"")'
+
+        c = ws.cell(row=n, column=COL_TOTAL_RETURN, value=h_f)
+        c.number_format = FMT_PCT
+        c = ws.cell(row=n, column=COL_MAX_RETURN, value=i_f)
+        c.number_format = FMT_PCT
+        c = ws.cell(row=n, column=COL_DURATION, value=l_f)
+        c.number_format = FMT_DECIMAL
+
+        # ── Row: Exit TP2 (trade N+1)
+        # H fires here because D<>"TP1" (D="TP2" or "Close entry(s) order Long")
+        _write_data_row(ws, exit_tp2_row,
+                        trade_num=tp2_trade_num,
+                        row_type="Exit long",
+                        dt_str=exit_tp2_dt_str,
+                        signal=tp2_signal,
+                        price=exit_tp2_price,
+                        size_qty=1,
+                        size_val=entry_price,
+                        net_pnl_usd=tp2_pnl_usd,
+                        net_pnl_pct=tp2_pnl_pct,
+                        fav_exc_usd=tp2_fav_usd,
+                        fav_exc_pct=tp2_fav_pct,
+                        adv_exc_usd=tp2_adv_usd,
+                        adv_exc_pct=tp2_adv_pct,
+                        cum_pnl_usd=round(cum_pnl_usd, 2),
+                        cum_pnl_pct=round(cum_pnl_pct, 4))
+
+        # Write H/I/L formulas for exit_tp2_row
+        n = exit_tp2_row
+        h_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
+               f'AVERAGE(N{n-1}:N{n})/100,"")')
+        i_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
+               f'((E{n-2}+O{n})/E{n-2})-1,"")')
+        l_f = f'=IF(I{n}<>"",_xlfn.DAYS(C{n},C{n-2}),"")'
+
+        c = ws.cell(row=n, column=COL_TOTAL_RETURN, value=h_f)
+        c.number_format = FMT_PCT
+        c = ws.cell(row=n, column=COL_MAX_RETURN, value=i_f)
+        c.number_format = FMT_PCT
+        c = ws.cell(row=n, column=COL_DURATION, value=l_f)
+        c.number_format = FMT_DECIMAL
+
     ws.freeze_panes = "A2"
-
-    # ── Column widths ─────────────────────────────────────────────────────────
-    _auto_width(ws, min_width=6)
+    _auto_width(ws, min_width=6, overrides={"C": 18, "O": 22, "Q": 20})
 
 
-def _build_4row_blocks(df: pd.DataFrame) -> list[dict]:
+def _write_data_row(ws, row: int, trade_num, row_type, dt_str, signal,
+                    price, size_qty, size_val,
+                    net_pnl_usd, net_pnl_pct,
+                    fav_exc_usd, fav_exc_pct,
+                    adv_exc_usd, adv_exc_pct,
+                    cum_pnl_usd, cum_pnl_pct):
+    """Write all data columns (not H/I/L — those get formula strings separately)."""
+    _set_cell(ws, row, COL_TRADE_NUM, trade_num)
+    _set_cell(ws, row, COL_TYPE, row_type)
+
+    # Write datetime — try to parse to Python datetime for proper Excel date handling
+    dt_val = _parse_dt(dt_str)
+    cell = ws.cell(row=row, column=COL_DATETIME, value=dt_val)
+    cell.number_format = FMT_DATETIME
+    cell.font = FONT_NORMAL
+
+    _set_cell(ws, row, COL_SIGNAL,  signal)
+    _set_cell(ws, row, COL_PRICE,   price)
+    _set_cell(ws, row, COL_SIZE_QTY, size_qty)
+    _set_cell(ws, row, COL_SIZE_VAL, round(size_val, 4))
+
+    # H, I, L are formula-only — skip here (written by caller)
+
+    _set_cell(ws, row, COL_NET_PNL_USD, round(net_pnl_usd, 2))
+    _set_cell(ws, row, COL_NET_PNL_PCT, round(net_pnl_pct, 4), fmt=FMT_DECIMAL)
+    _set_cell(ws, row, COL_FAV_EXC_USD, round(fav_exc_usd, 2))
+    _set_cell(ws, row, COL_FAV_EXC_PCT, round(fav_exc_pct, 4), fmt=FMT_DECIMAL)
+    _set_cell(ws, row, COL_ADV_EXC_USD, round(adv_exc_usd, 2))
+    _set_cell(ws, row, COL_ADV_EXC_PCT, round(adv_exc_pct, 4), fmt=FMT_DECIMAL)
+
+    if cum_pnl_usd is not None:
+        _set_cell(ws, row, COL_CUM_PNL_USD, cum_pnl_usd)
+    if cum_pnl_pct is not None:
+        _set_cell(ws, row, COL_CUM_PNL_PCT, round(cum_pnl_pct, 4), fmt=FMT_DECIMAL)
+
+
+def _parse_dt(dt_str):
+    """Parse datetime string to Python datetime for proper Excel serial date."""
+    if dt_str is None:
+        return None
+    import datetime
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(str(dt_str), fmt)
+        except ValueError:
+            pass
+    return dt_str  # fallback: leave as string
+
+
+def _exit_signal_label(exit_type: str, leg: str) -> str:
     """
-    Convert tps_engine output (alternating entry/exit pairs per trade leg)
-    into reference 4-row blocks:
-        [Entry TP1, Entry TP2, Exit TP1, Exit TP2]
-    and inject Excel formula strings for H, I, L columns.
+    Convert engine exit_type to reference signal label.
+    Reference uses: "TP1", "TP2", "Close entry(s) order Long"
     """
-    # The engine produces rows in this pattern per trade group:
-    #   trade N   Entry long   (TP1 leg)
-    #   trade N   Exit long    (TP1 leg)
-    #   trade N+1 Entry long   (TP2 leg)
-    #   trade N+1 Exit long    (TP2 leg)
-    # We need to group by entry_time and reorder.
+    if exit_type == "tp1":
+        return "TP1"
+    if exit_type == "tp2":
+        return "TP2"
+    # stop, adj_stop, time → "Close entry(s) order Long"
+    return "Close entry(s) order Long"
 
-    # Convert to list of dicts
+
+def _build_signal_blocks(df: pd.DataFrame) -> list:
+    """
+    Convert tps_engine.trades_to_dataframe() output into signal blocks.
+
+    The engine produces rows grouped by entry_time, in signal order (TP1 then TP2):
+        Entry long  | TP1 leg
+        Exit long   | TP1 leg
+        Entry long  | TP2 leg
+        Exit long   | TP2 leg
+
+    We need to regroup into 4-row blocks:
+        Entry TP1, Entry TP2, Exit TP1, Exit TP2
+
+    Each block dict contains: entry, exit_tp1, exit_tp2
+    where entry has: entry_price, entry_time_str
+    and exits have: exit_price, exit_time_str, exit_type, fav_exc_pct, adv_exc_pct
+    """
     records = df.to_dict("records")
 
-    # Group into 4-row blocks by detecting Entry/Exit pairs
-    # Walk through and collect (entry_tp1, exit_tp1, entry_tp2, exit_tp2) quads
+    # Walk records in groups of 4: [entry_tp1, exit_tp1, entry_tp2, exit_tp2]
     blocks = []
     i = 0
     while i < len(records):
-        # Expect: entry_tp1, exit_tp1, entry_tp2, exit_tp2
-        if i + 3 < len(records):
-            e1 = records[i]
-            x1 = records[i + 1]
-            e2 = records[i + 2]
-            x2 = records[i + 3]
-            if (e1.get("Type") == "Entry long" and x1.get("Type") == "Exit long" and
-                    e2.get("Type") == "Entry long" and x2.get("Type") == "Exit long"):
-                blocks.append((e1, x1, e2, x2))
+        remaining = len(records) - i
+        if remaining >= 4:
+            r0 = records[i]
+            r1 = records[i + 1]
+            r2 = records[i + 2]
+            r3 = records[i + 3]
+            if (r0.get("Type") == "Entry long" and r1.get("Type") == "Exit long" and
+                    r2.get("Type") == "Entry long" and r3.get("Type") == "Exit long"):
+                blocks.append(_make_block(r0, r1, r2, r3))
                 i += 4
                 continue
-        # Fallback: take whatever we have
-        if i + 1 < len(records):
-            e1 = records[i]
-            x1 = records[i + 1]
-            blocks.append((e1, x1, None, None))
-            i += 2
-        else:
-            break
+        if remaining >= 2:
+            r0 = records[i]
+            r1 = records[i + 1]
+            if r0.get("Type") == "Entry long" and r1.get("Type") == "Exit long":
+                # Partial: duplicate leg as both TP1 and TP2
+                blocks.append(_make_block(r0, r1, r0, r1))
+                i += 2
+                continue
+        i += 1  # skip malformed row
 
-    # Build output rows — formula injection is handled in _write_ticker_sheet
-    # based on excel row number, so just return stripped dicts in order.
-    out = []
-    for k, block in enumerate(blocks):
-        e1, x1, e2, x2 = block
-
-        out.append(_strip_row(e1))
-
-        if e2 is not None:
-            out.append(_strip_row(e2))
-
-        out.append(_strip_row(x1))
-
-        if x2 is not None:
-            out.append(_strip_row(x2))
-        else:
-            # Partial block (only TP1 leg available)
-            out.append(_strip_row(x1))
-
-    return out
+    return blocks
 
 
-def _strip_row(row: dict) -> dict:
-    """Return row dict without Total Return / Max Return / Duration
-    (those are replaced by formula strings)."""
-    keep = {
-        "Trade #", "Type", "Date and time", "Signal",
-        "Price USD", "Size (qty)", "Size (value)",
-        "Net P&L USD", "Net P&L %",
-        "Favorable excursion USD", "Favorable excursion %",
-        "Adverse excursion USD", "Adverse excursion %",
-        "Cumulative P&L USD", "Cumulative P&L %",
+def _make_block(entry_r0, exit_r1, entry_r2, exit_r3) -> dict:
+    """
+    Create a block dict from the 4 raw rows.
+    entry_r0 / entry_r2 are Entry long rows (TP1 and TP2 legs)
+    exit_r1  / exit_r3  are Exit long rows (TP1 and TP2 legs)
+    """
+    def _exit_type_from_row(row):
+        sig = row.get("Signal", "")
+        if sig == "TP1":
+            return "tp1"
+        if sig == "TP2":
+            return "tp2"
+        return "time"  # Close entry(s) order Long or other
+
+    entry_price = entry_r0.get("Price USD", 0)
+
+    return {
+        "entry": {
+            "entry_price":    entry_price,
+            "entry_time_str": entry_r0.get("Date and time", ""),
+        },
+        "exit_tp1": {
+            "exit_price":     exit_r1.get("Price USD", entry_price),
+            "exit_time_str":  exit_r1.get("Date and time", ""),
+            "exit_type":      _exit_type_from_row(exit_r1),
+            "fav_exc_pct":    exit_r1.get("Favorable excursion %", 0) or 0,
+            "adv_exc_pct":    exit_r1.get("Adverse excursion %", 0) or 0,
+        },
+        "exit_tp2": {
+            "exit_price":     exit_r3.get("Price USD", entry_price),
+            "exit_time_str":  exit_r3.get("Date and time", ""),
+            "exit_type":      _exit_type_from_row(exit_r3),
+            "fav_exc_pct":    exit_r3.get("Favorable excursion %", 0) or 0,
+            "adv_exc_pct":    exit_r3.get("Adverse excursion %", 0) or 0,
+        },
     }
-    return {k: v for k, v in row.items() if k in keep}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -476,8 +608,8 @@ def _strip_row(row: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def export_to_excel(
-    all_trades: dict,   # {ticker: df_trades}  from run_ticker()
-    cfg: dict,          # config dict (chart_tf, start_date, end_date, …)
+    all_trades: dict,   # {ticker: df_trades} from run_ticker()
+    cfg: dict,          # config dict (chart_tf, start_date, end_date, ...)
     output_path: str,   # where to save the .xlsx
 ) -> str:
     """
@@ -486,10 +618,9 @@ def export_to_excel(
     Parameters
     ----------
     all_trades : dict
-        Mapping of ticker → DataFrame produced by tps_engine.run_ticker()[1].
-        Keys are ticker strings; values are the formatted trade DataFrames.
+        Mapping ticker -> DataFrame from tps_engine.run_ticker()[1].
     cfg : dict
-        The config dict used for the backtest run (chart_tf, score_threshold, …).
+        Config dict used for the backtest run (chart_tf, score_threshold, ...).
     output_path : str
         Full path to the output .xlsx file (created/overwritten).
 
@@ -500,26 +631,25 @@ def export_to_excel(
     """
     chart_tf = int(cfg.get("chart_tf", 195))
 
-    # Determine ticker order: reference tickers first (if present), then others
+    # Determine ticker order: reference order first, then extras alphabetically
     available = set(all_trades.keys())
     ordered_tickers = [t for t in REFERENCE_TICKERS if t in available]
-    extras = [t for t in all_trades if t not in set(REFERENCE_TICKERS)]
-    ordered_tickers.extend(sorted(extras))
+    extras = sorted(t for t in all_trades if t not in set(REFERENCE_TICKERS))
+    ordered_tickers.extend(extras)
 
     wb = Workbook()
     # Remove default empty sheet
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
 
-    # ── Write individual ticker sheets first ──────────────────────────────────
+    # Write ticker sheets first (summary references them)
     for ticker in ordered_tickers:
         df = all_trades.get(ticker)
         _write_ticker_sheet(wb, ticker, df)
 
-    # ── Write summary sheet (inserted at position 0) ─────────────────────────
-    _write_summary_sheet(wb, all_trades, ordered_tickers, chart_tf)
+    # Write summary sheet (inserted at position 0)
+    _write_summary_sheet(wb, ordered_tickers, chart_tf)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(out))
