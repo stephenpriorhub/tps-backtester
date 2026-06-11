@@ -9,7 +9,7 @@ Run:
     streamlit run tps_app.py
 """
 
-import os, sys, json, hashlib, pickle, time
+import os, sys, json, hashlib, pickle, time, tempfile
 from pathlib import Path
 from datetime import date, datetime
 
@@ -24,6 +24,7 @@ PROJECT_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from tps_engine import DEFAULT_CONFIG, run_ticker
+from tps_export import export_to_excel
 import tps_run_massive as _trm
 from tps_run_massive import NDX100, fetch_bars, _cache_path, DATA_DIR
 
@@ -379,6 +380,24 @@ if results is None:
     st.stop()
 
 stats_df = build_stats_df(results)
+
+# ── Excel export button
+_cfg_used = st.session_state.cfg_used or cfg
+_xl_filename = (
+    f"TPS_Backtest_{_cfg_used['chart_tf']}m"
+    f"_{_cfg_used['start_date'][:7]}"
+    f"_{_cfg_used['end_date'][:7]}.xlsx"
+)
+with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _tmp:
+    _tmp_path = _tmp.name
+export_to_excel(results, _cfg_used, _tmp_path)
+with open(_tmp_path, "rb") as _xf:
+    st.download_button(
+        label="📥 Export to Excel",
+        data=_xf.read(),
+        file_name=_xl_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # ── Aggregate stat cards
 all_exits_list = [
