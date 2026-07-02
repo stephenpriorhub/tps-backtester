@@ -25,10 +25,10 @@ ET = pytz.timezone("America/New_York")
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    # Strategy params
-    "score_threshold": 50.0,
+    # Strategy params — defaults match the V1 TradingView baseline
+    "score_threshold": 65.0,
     "sqz_len": 20,
-    "min_sqz_bars": 2,
+    "min_sqz_bars": 3,
     "max_sqz_bars": 20,
     "release_bars": 3,
     "bb_len": 10,
@@ -37,7 +37,10 @@ DEFAULT_CONFIG = {
     "tp1_atr": 2.0,
     "tp2_atr": 3.0,
     "sl_atr": 2.0,
-    "time_exit_bars": 30,
+    "time_exit_bars": 0,       # 0 = no time exit (V1 baseline has none)
+    # Runner stop after TP1: "v1" keeps original -SL ATR stop (baseline);
+    # "be+1" moves stop to breakeven +1 ATR (v2 behavior)
+    "runner_stop_mode": "v1",
     # Chart timeframe in minutes (78 or 195)
     "chart_tf": 78,
     # Trend score weights (sum = 50)
@@ -427,7 +430,8 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
     tp1_atr = float(config["tp1_atr"])
     tp2_atr = float(config["tp2_atr"])
     sl_atr  = float(config["sl_atr"])
-    time_exit_bars = int(config["time_exit_bars"])
+    time_exit_bars = int(config.get("time_exit_bars", 0) or 0)  # 0 = disabled
+    runner_stop_mode = str(config.get("runner_stop_mode", "v1"))
 
     trades = []
 
@@ -477,14 +481,16 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                 tp1_price = entry_price + entry_atr * tp1_atr
                 tp2_price = entry_price + entry_atr * tp2_atr
                 sl_price  = entry_price - entry_atr * sl_atr
-                adj_stop  = entry_price + entry_atr * 1.0  # breakeven+
+                # Runner stop after TP1: v1 keeps original stop; be+1 locks profit
+                adj_stop  = sl_price if runner_stop_mode == "v1" \
+                            else entry_price + entry_atr * 1.0
         else:
             bars_since_entry += 1
 
             if not tp1_hit:
                 # ─── Both contracts still open ───
-                # Check time exit first (lowest priority)
-                time_exit = bars_since_entry >= time_exit_bars
+                # Check time exit first (lowest priority); 0 = disabled
+                time_exit = time_exit_bars > 0 and bars_since_entry >= time_exit_bars
 
                 if c_close <= sl_price:
                     # Stop loss hits both
@@ -516,7 +522,8 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                     tp1_hit = True
                     bars_since_tp1 = 0
                     peak_close_since_tp1 = c_close
-                    adj_stop = entry_price + entry_atr * 1.0
+                    adj_stop = sl_price if runner_stop_mode == "v1" \
+                               else entry_price + entry_atr * 1.0
 
                 elif time_exit:
                     # Time exit — both contracts
@@ -543,7 +550,7 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                     peak_close_since_tp1 = max(peak_close_since_tp1, c_close)
 
                 fav_exc_tp2 = (peak_close_since_tp1 - entry_price) if peak_close_since_tp1 else 0.0
-                time_exit_2 = bars_since_tp1 >= time_exit_bars
+                time_exit_2 = time_exit_bars > 0 and bars_since_tp1 >= time_exit_bars
 
                 if c_close <= adj_stop:
                     trades.append(_make_trade(

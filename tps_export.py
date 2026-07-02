@@ -66,12 +66,16 @@ def _auto_width(ws, min_width: int = 8, max_width: int = 30, overrides: dict = N
 # SUMMARY SHEET
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _write_summary_sheet(wb: Workbook, tickers: list, chart_tf: int) -> None:
+def _write_summary_sheet(wb: Workbook, tickers: list, chart_tf: int,
+                         stats_by_ticker: dict) -> None:
     """
-    Build the Summary sheet with Excel INDIRECT formulas referencing ticker sheets.
+    Build the Summary sheet with COMPUTED VALUES (no formulas) so it renders
+    identically in Excel, Numbers, Quick Look, and any parser — matching the
+    reference workbook, whose summary holds cached values.
+
     Layout: 13 rows × (2 + n_tickers + 1) columns
     Row 1: blank A1, ticker names in B..., "V2 (tf)avgs" in last col
-    Rows 2–11: metric labels in A, INDIRECT formulas per ticker, AVERAGE/SUM in avgs col
+    Rows 2–11: metric labels in A, values per ticker, SUM/AVERAGE in avgs col
     Row 13: footer with avg-days-in and exp/day calculations
     """
     sheet_name = f"{chart_tf}min Summary"
@@ -101,95 +105,52 @@ def _write_summary_sheet(wb: Workbook, tickers: list, chart_tf: int) -> None:
     for offset, label in enumerate(metric_labels):
         _set_cell(ws, offset + 2, 1, label, bold=True)
 
-    # ── Per-ticker INDIRECT formulas
+    # (row, stats key, number format, aggregate fn for the avgs column)
+    metric_rows = [
+        (2,  "count",        FMT_NUMBER, "sum"),
+        (3,  "wins",         FMT_NUMBER, "sum"),
+        (4,  "win_rate",     FMT_PCT,    "avg"),
+        (5,  "avg_ret",      FMT_PCT,    "avg"),
+        (6,  "avg_win",      FMT_PCT,    "avg"),
+        (7,  "avg_loss",     FMT_PCT,    "avg"),
+        (8,  "avg_max_ret",  FMT_PCT,    "avg"),
+        (9,  "win_rate_max", FMT_PCT,    "avg"),
+        (10, "expectancy",   FMT_PCT,    "avg"),
+        (11, "avg_dur",      FMT_NUMBER, "avg"),
+    ]
+
+    # ── Per-ticker computed values
     for i, ticker in enumerate(tickers):
         col = i + 2
-        cl = _col_letter(col)
+        stats = stats_by_ticker.get(ticker) or {}
+        for row, key, fmt, _agg in metric_rows:
+            _set_cell(ws, row, col, stats.get(key, 0), fmt=fmt)
 
-        # Row 2: Count = MAX(A:A)/2
-        _set_cell(ws, 2, col,
-                  f"=MAX(INDIRECT(\"'\"&{cl}$1&\"'!A:A\"))/2",
-                  fmt=FMT_NUMBER)
+    # ── Avgs column (SUM for counts, AVERAGE for rates/returns)
+    for row, key, fmt, agg in metric_rows:
+        vals = [(stats_by_ticker.get(t) or {}).get(key, 0) for t in tickers]
+        if agg == "sum":
+            out = sum(vals)
+        else:
+            out = sum(vals) / len(vals) if vals else 0
+        _set_cell(ws, row, avgs_col, out, fmt=fmt)
 
-        # Row 3: # Wins = COUNTIF(H:H, ">0")
-        _set_cell(ws, 3, col,
-                  f"=COUNTIF(INDIRECT({cl}$1&\"!H:H\"),\">0\")",
-                  fmt=FMT_NUMBER)
+    # ── Row 13: footer — avg days in (per-leg) and expectancy per day
+    all_avg_dur = [(stats_by_ticker.get(t) or {}).get("avg_dur", 0) for t in tickers]
+    all_expect  = [(stats_by_ticker.get(t) or {}).get("expectancy", 0) for t in tickers]
+    avg_dur_all = sum(all_avg_dur) / len(all_avg_dur) if all_avg_dur else 0
+    expect_all  = sum(all_expect) / len(all_expect) if all_expect else 0
+    avg_days_in = avg_dur_all / 2
+    exp_per_day = (expect_all / avg_days_in) if avg_days_in else 0
 
-        # Row 4: Win Rate
-        _set_cell(ws, 4, col,
-                  f"=IFERROR({cl}3/{cl}2,0)",
-                  fmt=FMT_PCT)
-
-        # Row 5: Avg Return %
-        _set_cell(ws, 5, col,
-                  f"=IFERROR(AVERAGE(INDIRECT({cl}$1&\"!H:H\")),0)",
-                  fmt=FMT_PCT)
-
-        # Row 6: Avg Win %
-        _set_cell(ws, 6, col,
-                  f"=IFERROR(AVERAGEIF(INDIRECT({cl}$1&\"!H:H\"),\">0\"),0)",
-                  fmt=FMT_PCT)
-
-        # Row 7: Avg Loss %
-        _set_cell(ws, 7, col,
-                  f"=IFERROR(AVERAGEIF(INDIRECT({cl}$1&\"!H:H\"),\"<0\"),0)",
-                  fmt=FMT_PCT)
-
-        # Row 8: Avg Max Return %
-        _set_cell(ws, 8, col,
-                  f"=IFERROR(AVERAGE(INDIRECT({cl}$1&\"!I:I\")),0)",
-                  fmt=FMT_PCT)
-
-        # Row 9: Win Rate (max)
-        _set_cell(ws, 9, col,
-                  f"=IFERROR(COUNTIF(INDIRECT({cl}$1&\"!I:I\"),\">0\")"
-                  f"/COUNT(INDIRECT({cl}$1&\"!I:I\")),0)",
-                  fmt=FMT_PCT)
-
-        # Row 10: Expectancy = WR * AvgWin + (1-WR) * AvgLoss
-        _set_cell(ws, 10, col,
-                  f"=IFERROR(({cl}4*{cl}6+(1-{cl}4)*{cl}7),0)",
-                  fmt=FMT_PCT)
-
-        # Row 11: Avg Duration (days)
-        _set_cell(ws, 11, col,
-                  f"=IFERROR(AVERAGE(INDIRECT({cl}$1&\"!L:L\")),0)",
-                  fmt=FMT_NUMBER)
-
-    # ── Avgs column
-    avgs_cl = _col_letter(avgs_col)
-    first_cl = "B"
-    last_cl  = _col_letter(n + 1)
-
-    _set_cell(ws, 2,  avgs_col, f"=SUM({first_cl}2:{last_cl}2)",   fmt=FMT_NUMBER)
-    _set_cell(ws, 3,  avgs_col, f"=SUM({first_cl}3:{last_cl}3)",   fmt=FMT_NUMBER)
-    _set_cell(ws, 4,  avgs_col, f"=AVERAGE({first_cl}4:{last_cl}4)", fmt=FMT_PCT)
-    _set_cell(ws, 5,  avgs_col, f"=AVERAGE({first_cl}5:{last_cl}5)", fmt=FMT_PCT)
-    _set_cell(ws, 6,  avgs_col, f"=AVERAGE({first_cl}6:{last_cl}6)", fmt=FMT_PCT)
-    _set_cell(ws, 7,  avgs_col, f"=AVERAGE({first_cl}7:{last_cl}7)", fmt=FMT_PCT)
-    _set_cell(ws, 8,  avgs_col, f"=AVERAGE({first_cl}8:{last_cl}8)", fmt=FMT_PCT)
-    _set_cell(ws, 9,  avgs_col, f"=AVERAGE({first_cl}9:{last_cl}9)", fmt=FMT_PCT)
-    _set_cell(ws, 10, avgs_col, f"=AVERAGE({first_cl}10:{last_cl}10)", fmt=FMT_PCT)
-    _set_cell(ws, 11, avgs_col, f"=AVERAGE({first_cl}11:{last_cl}11)", fmt=FMT_NUMBER)
-
-    # ── Row 13: footer
-    # Reference: I13="avg days in", J13=K11/2, K13=K10/J13, L13="exp / day"
-    # In our layout: (avgs_col-2), (avgs_col-1), avgs_col, (avgs_col+1)
     col_i = avgs_col - 2
     col_j = avgs_col - 1
     col_k = avgs_col
     col_l = avgs_col + 1
 
-    j_cl = _col_letter(col_j)
-
     _set_cell(ws, 13, col_i, "avg days in")
-    _set_cell(ws, 13, col_j,
-              f"={avgs_cl}11/2",
-              fmt=FMT_NUMBER)
-    _set_cell(ws, 13, col_k,
-              f"=IFERROR({avgs_cl}10/{j_cl}13,0)",
-              fmt=FMT_PCT3)
+    _set_cell(ws, 13, col_j, avg_days_in, fmt=FMT_NUMBER)
+    _set_cell(ws, 13, col_k, exp_per_day, fmt=FMT_PCT3)
     _set_cell(ws, 13, col_l, "exp / day")
 
     # ── Column widths
@@ -276,19 +237,14 @@ def _write_ticker_sheet(wb: Workbook, ticker: str, df: pd.DataFrame) -> None:
         if header is not None:
             _set_cell(ws, 1, col_idx, header, bold=True)
 
-    # ── In-sheet aggregate stats: J2, K2, J4, K4
-    ws.cell(row=2, column=COL_STATS_J).value = "=COUNTIF(H:H,\">0\")/COUNT(H:H)"
-    ws.cell(row=2, column=COL_STATS_J).number_format = FMT_PCT
-    ws.cell(row=2, column=COL_STATS_K).value = "=COUNTIF(I:I,\">0\")/COUNT(I:I)"
-    ws.cell(row=2, column=COL_STATS_K).number_format = FMT_PCT
-    ws.cell(row=4, column=COL_STATS_J).value = "=AVERAGE(H:H)"
-    ws.cell(row=4, column=COL_STATS_J).number_format = FMT_PCT
-    ws.cell(row=4, column=COL_STATS_K).value = "=AVERAGE(I:I)"
-    ws.cell(row=4, column=COL_STATS_K).number_format = FMT_PCT
+    # Per-signal aggregates collected while writing (H / I / L values)
+    h_vals: list = []   # Total Return (fraction, e.g. 0.0231)
+    i_vals: list = []   # Max Return (fraction)
+    l_vals: list = []   # Duration (whole days)
 
     if df is None or df.empty:
         ws.freeze_panes = "A2"
-        return
+        return _ticker_stats(h_vals, i_vals, l_vals)
 
     # ── Build 4-row blocks from engine output
     blocks = _build_signal_blocks(df)
@@ -402,21 +358,7 @@ def _write_ticker_sheet(wb: Workbook, ticker: str, df: pd.DataFrame) -> None:
                         cum_pnl_usd=round(cum_pnl_usd - tp2_pnl_usd, 2),
                         cum_pnl_pct=round(cum_pnl_pct - tp2_pnl_pct, 4))
 
-        # Write H/I/L formulas for exit_tp1_row
-        # H fires on TP2 exit only (D="TP1" here so condition fails, evaluates to "")
-        n = exit_tp1_row
-        h_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-               f'AVERAGE(N{n-1}:N{n})/100,"")')
-        i_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-               f'((E{n-2}+O{n})/E{n-2})-1,"")')
-        l_f = f'=IF(I{n}<>"",_xlfn.DAYS(C{n},C{n-2}),"")'
-
-        c = ws.cell(row=n, column=COL_TOTAL_RETURN, value=h_f)
-        c.number_format = FMT_PCT
-        c = ws.cell(row=n, column=COL_MAX_RETURN, value=i_f)
-        c.number_format = FMT_PCT
-        c = ws.cell(row=n, column=COL_DURATION, value=l_f)
-        c.number_format = FMT_DECIMAL
+        # H/I/L stay blank on the TP1 exit row (reference fires them on TP2 row only)
 
         # ── Row: Exit TP2 (trade N+1)
         # H fires here because D<>"TP1" (D="TP2" or "Close entry(s) order Long")
@@ -437,23 +379,73 @@ def _write_ticker_sheet(wb: Workbook, ticker: str, df: pd.DataFrame) -> None:
                         cum_pnl_usd=round(cum_pnl_usd, 2),
                         cum_pnl_pct=round(cum_pnl_pct, 4))
 
-        # Write H/I/L formulas for exit_tp2_row
+        # ── H/I/L computed VALUES on the TP2 exit row (reference semantics):
+        #    H = AVERAGE(N_tp1, N_tp2)/100          (per-signal total return, fraction)
+        #    I = ((entry + fav_exc_usd_tp2)/entry)-1 (per-signal max return, fraction)
+        #    L = DAYS(exit_tp2_date, entry_date)     (whole-day date difference)
         n = exit_tp2_row
-        h_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-               f'AVERAGE(N{n-1}:N{n})/100,"")')
-        i_f = (f'=IF(AND(D{n}<>"TP1",B{n}="Exit long",A{n}=A{n-2}),'
-               f'((E{n-2}+O{n})/E{n-2})-1,"")')
-        l_f = f'=IF(I{n}<>"",_xlfn.DAYS(C{n},C{n-2}),"")'
+        h_val = (tp1_pnl_pct + tp2_pnl_pct) / 2.0 / 100.0
+        i_val = ((entry_price + tp2_fav_usd) / entry_price) - 1 if entry_price else 0.0
+        entry_dt   = _parse_dt(entry_dt_str)
+        exit_tp2_dt = _parse_dt(exit_tp2_dt_str)
+        if hasattr(entry_dt, "date") and hasattr(exit_tp2_dt, "date"):
+            l_val = (exit_tp2_dt.date() - entry_dt.date()).days
+        else:
+            l_val = None
 
-        c = ws.cell(row=n, column=COL_TOTAL_RETURN, value=h_f)
+        c = ws.cell(row=n, column=COL_TOTAL_RETURN, value=round(h_val, 6))
         c.number_format = FMT_PCT
-        c = ws.cell(row=n, column=COL_MAX_RETURN, value=i_f)
+        c = ws.cell(row=n, column=COL_MAX_RETURN, value=round(i_val, 6))
         c.number_format = FMT_PCT
-        c = ws.cell(row=n, column=COL_DURATION, value=l_f)
-        c.number_format = FMT_DECIMAL
+        if l_val is not None:
+            c = ws.cell(row=n, column=COL_DURATION, value=l_val)
+            c.number_format = FMT_DECIMAL
+
+        h_vals.append(h_val)
+        i_vals.append(i_val)
+        if l_val is not None:
+            l_vals.append(l_val)
+
+    # ── In-sheet aggregate stats (computed values): J2, K2, J4, K4
+    if h_vals:
+        _set_cell(ws, 2, COL_STATS_J,
+                  sum(1 for v in h_vals if v > 0) / len(h_vals), fmt=FMT_PCT)
+        _set_cell(ws, 4, COL_STATS_J, sum(h_vals) / len(h_vals), fmt=FMT_PCT)
+    if i_vals:
+        _set_cell(ws, 2, COL_STATS_K,
+                  sum(1 for v in i_vals if v > 0) / len(i_vals), fmt=FMT_PCT)
+        _set_cell(ws, 4, COL_STATS_K, sum(i_vals) / len(i_vals), fmt=FMT_PCT)
 
     ws.freeze_panes = "A2"
     _auto_width(ws, min_width=6, overrides={"C": 18, "O": 22, "Q": 20})
+    return _ticker_stats(h_vals, i_vals, l_vals)
+
+
+def _ticker_stats(h_vals: list, i_vals: list, l_vals: list) -> dict:
+    """Compute the ten summary metrics for one ticker from per-signal values."""
+    n = len(h_vals)
+    if n == 0:
+        return {k: 0 for k in ("count", "wins", "win_rate", "avg_ret", "avg_win",
+                                "avg_loss", "avg_max_ret", "win_rate_max",
+                                "expectancy", "avg_dur")}
+    wins     = sum(1 for v in h_vals if v > 0)
+    win_rate = wins / n
+    pos      = [v for v in h_vals if v > 0]
+    neg      = [v for v in h_vals if v < 0]
+    avg_win  = sum(pos) / len(pos) if pos else 0.0
+    avg_loss = sum(neg) / len(neg) if neg else 0.0
+    return {
+        "count":        n,
+        "wins":         wins,
+        "win_rate":     win_rate,
+        "avg_ret":      sum(h_vals) / n,
+        "avg_win":      avg_win,
+        "avg_loss":     avg_loss,
+        "avg_max_ret":  sum(i_vals) / len(i_vals) if i_vals else 0.0,
+        "win_rate_max": (sum(1 for v in i_vals if v > 0) / len(i_vals)) if i_vals else 0.0,
+        "expectancy":   win_rate * avg_win + (1 - win_rate) * avg_loss,
+        "avg_dur":      sum(l_vals) / len(l_vals) if l_vals else 0.0,
+    }
 
 
 def _write_data_row(ws, row: int, trade_num, row_type, dt_str, signal,
@@ -508,14 +500,10 @@ def _parse_dt(dt_str):
 def _exit_signal_label(exit_type: str, leg: str) -> str:
     """
     Convert engine exit_type to reference signal label.
-    Reference uses: "TP1", "TP2", "Close entry(s) order Long"
+    The V1 reference workbook labels EVERY exit with its order ID ("TP1"/"TP2"),
+    including stop-outs and time exits — match that exactly.
     """
-    if exit_type == "tp1":
-        return "TP1"
-    if exit_type == "tp2":
-        return "TP2"
-    # stop, adj_stop, time → "Close entry(s) order Long"
-    return "Close entry(s) order Long"
+    return leg
 
 
 def _build_signal_blocks(df: pd.DataFrame) -> list:
@@ -642,13 +630,14 @@ def export_to_excel(
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
 
-    # Write ticker sheets first (summary references them)
+    # Write ticker sheets first, collecting computed stats for the summary
+    stats_by_ticker = {}
     for ticker in ordered_tickers:
         df = all_trades.get(ticker)
-        _write_ticker_sheet(wb, ticker, df)
+        stats_by_ticker[ticker] = _write_ticker_sheet(wb, ticker, df)
 
-    # Write summary sheet (inserted at position 0)
-    _write_summary_sheet(wb, ordered_tickers, chart_tf)
+    # Write summary sheet with computed values (inserted at position 0)
+    _write_summary_sheet(wb, ordered_tickers, chart_tf, stats_by_ticker)
 
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)

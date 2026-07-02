@@ -288,8 +288,20 @@ with st.sidebar:
     tp1_atr = c1.number_input("TP1 ATR", 0.5, 10.0, float(DEFAULT_CONFIG["tp1_atr"]), 0.5)
     tp2_atr = c2.number_input("TP2 ATR", 0.5, 10.0, float(DEFAULT_CONFIG["tp2_atr"]), 0.5)
     sl_atr  = c3.number_input("SL ATR",  0.5, 10.0, float(DEFAULT_CONFIG["sl_atr"]),  0.5)
-    time_exit = st.number_input("Time-exit bars", 5, 100,
-                                 int(DEFAULT_CONFIG["time_exit_bars"]))
+
+    runner_stop = st.selectbox(
+        "Runner stop after TP1",
+        ["Original stop (v1 baseline)", "Breakeven +1 ATR (v2)"],
+        index=0 if DEFAULT_CONFIG.get("runner_stop_mode", "v1") == "v1" else 1,
+        help="v1 keeps the -SL ATR stop on the second contract after TP1 fills "
+             "(matches the TradingView V1 backtest). v2 raises it to entry +1 ATR.")
+
+    time_exit_on = st.checkbox(
+        "Time exit", value=int(DEFAULT_CONFIG["time_exit_bars"]) > 0,
+        help="Off = trades only exit at TP1/TP2/stop (matches the V1 baseline)")
+    time_exit = st.number_input("Time-exit bars", 5, 500,
+                                 max(int(DEFAULT_CONFIG["time_exit_bars"]), 30),
+                                 disabled=not time_exit_on)
 
     # ── BB entry
     with st.expander("BB Entry (advanced)"):
@@ -367,7 +379,8 @@ cfg = {
     "tp1_atr":         tp1_atr,
     "tp2_atr":         tp2_atr,
     "sl_atr":          sl_atr,
-    "time_exit_bars":  time_exit,
+    "runner_stop_mode": "v1" if runner_stop.startswith("Original") else "be+1",
+    "time_exit_bars":  time_exit if time_exit_on else 0,
     "bb_len":          bb_len,
     "bb_dev":          bb_dev,
     "sqz_len":         sqz_len,
@@ -563,9 +576,8 @@ with tabs[0]:
         hide_index=True,
     )
 
-    # Download button
-    csv = display[show_cols].rename(columns={"ticker": "Ticker"}).to_csv(index=False)
-    st.download_button("⬇ Download CSV", csv, "tps_results.csv", "text/csv")
+    # Single download: the Excel workbook (summary + per-ticker trades) is the
+    # one export, delivered from the main download button above.
 
 # ── Tab 2: Charts
 with tabs[1]:
