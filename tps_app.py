@@ -24,7 +24,7 @@ PROJECT_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from tps_engine import DEFAULT_CONFIG, run_ticker
-from tps_export import export_to_excel
+from tps_export import export_to_excel, compute_signal_stats
 import tps_run_massive as _trm
 from tps_run_massive import NDX100, fetch_bars, _cache_path, DATA_DIR
 
@@ -123,27 +123,28 @@ def load_saved_test(fname: str) -> dict:
 
 
 def ticker_stats(ticker: str, df_trades: pd.DataFrame) -> dict:
-    empty = dict(ticker=ticker, n=0, wr=0.0, avg_r=0.0,
-                 avg_win=0.0, avg_loss=0.0, exp=0.0,
-                 avg_dur=0.0, best=0.0, worst=0.0, score=0.0)
-    if df_trades is None or df_trades.empty:
-        return empty
-    exits = df_trades[df_trades["Type"] == "Exit long"]
-    if exits.empty:
-        return empty
-    pnl  = exits["Net P&L %"]
-    wins = pnl[pnl > 0]
-    loss = pnl[pnl <= 0]
-    n    = len(exits)
-    wr   = len(wins) / n if n else 0
-    avg_r    = pnl.mean()
-    avg_win  = wins.mean()  if len(wins) else 0.0
-    avg_loss = loss.mean()  if len(loss) else 0.0
-    exp      = wr * avg_win + (1 - wr) * abs(avg_loss) * -1 if n else 0.0
-    avg_dur  = exits["Duration"].mean() if "Duration" in exits.columns else 0.0
-    return dict(ticker=ticker, n=n, wr=wr, avg_r=avg_r, avg_win=avg_win,
-                avg_loss=avg_loss, exp=exp, avg_dur=avg_dur,
-                best=pnl.max(), worst=pnl.min(), score=wr * avg_r)
+    """
+    Per-SIGNAL stats for one ticker — identical math to the exported workbook
+    summary (via tps_export.compute_signal_stats), so the on-screen numbers
+    always match the spreadsheet. All %-values are returned in PERCENT.
+    """
+    s = compute_signal_stats(df_trades)
+    n  = s["count"]
+    wr = s["win_rate"]
+    avg_r = s["avg_ret"] * 100
+    return dict(
+        ticker=ticker,
+        n=n,                                   # per-signal trade count
+        wr=wr,
+        avg_r=avg_r,
+        avg_win=s["avg_win"] * 100,
+        avg_loss=s["avg_loss"] * 100,
+        avg_max_ret=s["avg_max_ret"] * 100,
+        wr_max=s["win_rate_max"],
+        exp=s["expectancy"] * 100,
+        avg_dur=s["avg_dur"],
+        score=wr * avg_r,
+    )
 
 
 def build_stats_df(all_trades: dict) -> pd.DataFrame:
@@ -557,30 +558,23 @@ with open(_tmp_path, "rb") as _xf:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# ── Aggregate stat cards
-all_exits_list = [
-    df[df["Type"] == "Exit long"]
-    for df in results.values()
-    if df is not None and not df.empty
-]
-if all_exits_list:
-    all_exits = pd.concat(all_exits_list, ignore_index=True)
-    agg_n   = len(all_exits)
-    agg_wr  = (all_exits["Net P&L %"] > 0).sum() / agg_n * 100 if agg_n else 0
-    agg_avg = all_exits["Net P&L %"].mean() if agg_n else 0
-    agg_exp = (
-        (all_exits[all_exits["Net P&L %"] > 0]["Net P&L %"].mean() *
-         (all_exits["Net P&L %"] > 0).mean()) +
-        (all_exits[all_exits["Net P&L %"] <= 0]["Net P&L %"].mean() *
-         (all_exits["Net P&L %"] <= 0).mean())
-    ) if agg_n else 0
-    agg_dur = all_exits["Duration"].mean() if "Duration" in all_exits.columns else 0
-    active_tickers = (stats_df["n"] > 0).sum()
+# ── Aggregate stat cards — mirror the workbook Summary "avgs" column:
+#    counts are SUMMED across tickers; rates/returns are EQUAL-WEIGHT AVERAGED
+#    across tickers (this is how the reference spreadsheet computes its totals).
+active = stats_df[stats_df["n"] > 0]
+if not active.empty:
+    agg_n   = int(active["n"].sum())                 # total signals (per-signal)
+    agg_wins = int(round((active["wr"] * active["n"]).sum()))
+    agg_wr  = active["wr"].mean() * 100               # avg of per-ticker win rates
+    agg_avg = active["avg_r"].mean()                  # avg of per-ticker avg returns
+    agg_exp = active["exp"].mean()
+    agg_dur = active["avg_dur"].mean()
+    active_tickers = len(active)
 
     cols = st.columns(6)
     metrics = [
         ("Tickers w/ Trades",  f"{active_tickers}/{len(tickers)}", ""),
-        ("Total Exits",        f"{agg_n:,}",                      ""),
+        ("Total Trades",       f"{agg_n:,}",                      ""),
         ("Win Rate",           f"{agg_wr:.1f}%",                  "win" if agg_wr >= 55 else "loss"),
         ("Avg Return",         f"{agg_avg:+.3f}%",                "win" if agg_avg > 0 else "loss"),
         ("Expectancy",         f"{agg_exp:+.3f}%",                "win" if agg_exp > 0 else "loss"),
@@ -607,25 +601,34 @@ with tabs[0]:
     st.subheader("Ranked Results")
 
     display = stats_df.copy()
-    display["Win Rate"]       = (display["wr"] * 100).round(1).astype(str) + "%"
-    display["Avg Return %"]   = display["avg_r"].round(3).astype(str) + "%"
-    display["Avg Win %"]      = display["avg_win"].round(3).astype(str) + "%"
-    display["Avg Loss %"]     = display["avg_loss"].round(3).astype(str) + "%"
-    display["Expectancy"]     = display["exp"].round(4)
-    display["Avg Duration"]   = display["avg_dur"].round(1).astype(str) + "d"
-    display["Trades"]         = (display["n"] // 2).astype(int)
+    display["Trades"]          = display["n"].astype(int)
+    display["Win Rate"]        = (display["wr"] * 100).round(1).astype(str) + "%"
+    display["Avg Return %"]    = display["avg_r"].round(3).astype(str) + "%"
+    display["Avg Win %"]       = display["avg_win"].round(3).astype(str) + "%"
+    display["Avg Loss %"]      = display["avg_loss"].round(3).astype(str) + "%"
+    display["Avg Max Ret %"]   = display["avg_max_ret"].round(3).astype(str) + "%"
+    display["Win Rate (max)"]  = (display["wr_max"] * 100).round(1).astype(str) + "%"
+    display["Expectancy %"]    = display["exp"].round(3).astype(str) + "%"
+    display["Avg Duration"]    = display["avg_dur"].round(1).astype(str) + "d"
 
     show_cols = ["Rank", "ticker", "Trades", "Win Rate", "Avg Return %",
-                 "Avg Win %", "Avg Loss %", "Expectancy", "Avg Duration"]
+                 "Avg Win %", "Avg Loss %", "Avg Max Ret %", "Win Rate (max)",
+                 "Expectancy %", "Avg Duration"]
     st.dataframe(
         display[show_cols].rename(columns={"ticker": "Ticker"}),
         use_container_width=True,
         height=min(600, 36 * len(display) + 38),
         hide_index=True,
     )
-
-    # Single download: the Excel workbook (summary + per-ticker trades) is the
-    # one export, delivered from the main download button above.
+    st.caption(
+        "Per-signal stats (both TP legs averaged) — identical to the exported "
+        "workbook's Summary tab. Totals: "
+        f"**{int(active['n'].sum())} trades**, "
+        f"**{active['wr'].mean()*100:.1f}%** win rate, "
+        f"**{active['avg_r'].mean():+.3f}%** avg return "
+        "(win-rate & returns are equal-weight averages across tickers, matching "
+        "the spreadsheet)."
+    )
 
 # ── Tab 2: Charts
 with tabs[1]:
@@ -699,15 +702,11 @@ with tabs[2]:
         sel_ticker = col1.selectbox("Select ticker", active_tickers_list)
         df_t = results[sel_ticker]
         if df_t is not None and not df_t.empty:
-            exits_t = df_t[df_t["Type"] == "Exit long"]
-            pnl_t   = exits_t["Net P&L %"]
-            wr_t    = (pnl_t > 0).sum() / len(pnl_t) * 100 if len(pnl_t) else 0
-            avg_t   = pnl_t.mean() if len(pnl_t) else 0
-
+            s_t = compute_signal_stats(df_t)
             col2.markdown(
-                f"**{sel_ticker}** — {len(exits_t)//2} signals  |  "
-                f"WR {wr_t:.1f}%  |  Avg {avg_t:+.3f}%  |  "
-                f"Best {pnl_t.max():+.3f}%  |  Worst {pnl_t.min():+.3f}%"
+                f"**{sel_ticker}** — {s_t['count']} signals  |  "
+                f"WR {s_t['win_rate']*100:.1f}%  |  Avg {s_t['avg_ret']*100:+.3f}%  |  "
+                f"Avg Win {s_t['avg_win']*100:+.3f}%  |  Avg Loss {s_t['avg_loss']*100:+.3f}%"
             )
 
             # Equity curve
@@ -757,7 +756,7 @@ if has_baseline and len(tabs) == 4:
         )
         merged["ΔWR"]       = (merged["wr"] - merged["wr_base"]) * 100
         merged["ΔAvg R%"]   = merged["avg_r"] - merged["avg_r_base"]
-        merged["ΔTrades"]   = (merged["n"] // 2) - (merged["n_base"] // 2)
+        merged["ΔTrades"]   = merged["n"] - merged["n_base"]
         merged["ΔExp"]      = merged["exp"] - merged["exp_base"]
 
         def _color_delta(val):

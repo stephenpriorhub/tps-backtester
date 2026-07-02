@@ -421,6 +421,44 @@ def _write_ticker_sheet(wb: Workbook, ticker: str, df: pd.DataFrame) -> None:
     return _ticker_stats(h_vals, i_vals, l_vals)
 
 
+def _signal_values(df: pd.DataFrame):
+    """
+    Reduce a ticker's raw trade DataFrame to per-SIGNAL value lists, using the
+    exact same math the Excel export writes into columns H / I / L:
+        h = average of the two legs' net return (fraction)   — "Total Return"
+        i = ((entry + TP2-leg favorable excursion $)/entry)-1 — "Max Return"
+        l = whole-day span from entry to the TP2 exit         — "Duration (days)"
+    This is the single source of truth for both the workbook summary and the
+    on-screen dashboard summary, so they can never disagree.
+    """
+    h_vals, i_vals, l_vals = [], [], []
+    if df is None or df.empty:
+        return h_vals, i_vals, l_vals
+    for block in _build_signal_blocks(df):
+        entry_price    = block["entry"]["entry_price"]
+        if not entry_price:
+            continue
+        exit_tp1_price = block["exit_tp1"]["exit_price"]
+        exit_tp2_price = block["exit_tp2"]["exit_price"]
+        tp1_pnl_pct = (exit_tp1_price - entry_price) / entry_price * 100
+        tp2_pnl_pct = (exit_tp2_price - entry_price) / entry_price * 100
+        tp2_fav_usd = round(block["exit_tp2"]["fav_exc_pct"] / 100 * entry_price, 2)
+
+        h_vals.append((tp1_pnl_pct + tp2_pnl_pct) / 2.0 / 100.0)
+        i_vals.append(((entry_price + tp2_fav_usd) / entry_price) - 1)
+
+        entry_dt    = _parse_dt(block["entry"]["entry_time_str"])
+        exit_tp2_dt = _parse_dt(block["exit_tp2"]["exit_time_str"])
+        if hasattr(entry_dt, "date") and hasattr(exit_tp2_dt, "date"):
+            l_vals.append((exit_tp2_dt.date() - entry_dt.date()).days)
+    return h_vals, i_vals, l_vals
+
+
+def compute_signal_stats(df: pd.DataFrame) -> dict:
+    """Per-ticker summary metrics (per-signal) — matches the workbook summary tab."""
+    return _ticker_stats(*_signal_values(df))
+
+
 def _ticker_stats(h_vals: list, i_vals: list, l_vals: list) -> dict:
     """Compute the ten summary metrics for one ticker from per-signal values."""
     n = len(h_vals)
