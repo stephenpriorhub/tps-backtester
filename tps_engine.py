@@ -41,6 +41,11 @@ DEFAULT_CONFIG = {
     # Runner stop after TP1: "v1" keeps original -SL ATR stop (baseline);
     # "be+1" moves stop to breakeven +1 ATR (v2 behavior)
     "runner_stop_mode": "v1",
+    # Exit fill detection to match the V1 TradingView reference:
+    # take-profit fills intrabar (limit touched by the high), stop triggers
+    # on the bar CLOSE. This reproduced the reference count/WR/avg-return.
+    "stop_trigger": "close",   # "close" | "intrabar"
+    "tp_trigger":   "intrabar",# "intrabar" | "close"
     # Chart timeframe in minutes (78 or 195)
     "chart_tf": 78,
     # Trend score weights (sum = 50)
@@ -432,6 +437,10 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
     sl_atr  = float(config["sl_atr"])
     time_exit_bars = int(config.get("time_exit_bars", 0) or 0)  # 0 = disabled
     runner_stop_mode = str(config.get("runner_stop_mode", "v1"))
+    # Exit fill detection: "intrabar" uses bar high/low (TradingView strategy.exit
+    # default); "close" only triggers when the bar CLOSE crosses the level.
+    stop_trig = str(config.get("stop_trigger", "intrabar"))
+    tp_trig   = str(config.get("tp_trigger", "intrabar"))
 
     trades = []
 
@@ -476,7 +485,9 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                 tp1_hit     = False
                 bars_since_entry = 0
                 bars_since_tp1   = 0
-                peak_close_since_tp1 = None
+                # True MFE/MAE trackers — running high/low since entry (intrabar)
+                run_high = entry_price
+                run_low  = entry_price
 
                 tp1_price = entry_price + entry_atr * tp1_atr
                 tp2_price = entry_price + entry_atr * tp2_atr
@@ -486,90 +497,81 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                             else entry_price + entry_atr * 1.0
         else:
             bars_since_entry += 1
+            # Track MFE/MAE on bar CLOSES (matches the reference's run-up /
+            # drawdown, which ignores intrabar wicks — ~68% win-rate-max, not 95%)
+            run_high = max(run_high, c_close)
+            run_low  = min(run_low,  c_close)
+            fav = run_high - entry_price   # favorable excursion USD (>= 0)
+            adv = run_low  - entry_price   # adverse   excursion USD (<= 0)
 
             if not tp1_hit:
                 # ─── Both contracts still open ───
-                # Check time exit first (lowest priority); 0 = disabled
+                # TradingView fills stop/limit orders INTRABAR on high/low, not
+                # on close; fill AT the order price. Same-bar tie → stop first
+                # (pessimistic, matches TV's default without bar magnifier).
+                hit_stop = (c_low  <= sl_price) if stop_trig == "intrabar" else (c_close <= sl_price)
+                hit_tp1  = (c_high >= tp1_price) if tp_trig   == "intrabar" else (c_close >= tp1_price)
                 time_exit = time_exit_bars > 0 and bars_since_entry >= time_exit_bars
 
-                if c_close <= sl_price:
-                    # Stop loss hits both
+                if hit_stop:
                     trades.append(_make_trade(
                         signal="TP1", exit_type="stop",
                         entry_time=entry_time, exit_time=t,
-                        entry_price=entry_price, exit_price=c_close,
-                        fav_exc=max(0.0, tp1_price - entry_price) if c_close < entry_price else c_close - entry_price,
-                        adv_exc=c_close - entry_price,
-                    ))
+                        entry_price=entry_price, exit_price=sl_price,
+                        fav_exc=fav, adv_exc=adv))
                     trades.append(_make_trade(
                         signal="TP2", exit_type="stop",
                         entry_time=entry_time, exit_time=t,
-                        entry_price=entry_price, exit_price=c_close,
-                        fav_exc=max(0.0, tp2_price - entry_price) if c_close < entry_price else c_close - entry_price,
-                        adv_exc=c_close - entry_price,
-                    ))
+                        entry_price=entry_price, exit_price=sl_price,
+                        fav_exc=fav, adv_exc=adv))
                     in_pos = False
 
-                elif c_close >= tp1_price:
-                    # TP1 fills
+                elif hit_tp1:
+                    # TP1 limit fills at target; runner continues
                     trades.append(_make_trade(
                         signal="TP1", exit_type="tp1",
                         entry_time=entry_time, exit_time=t,
-                        entry_price=entry_price, exit_price=c_close,
-                        fav_exc=c_close - entry_price,
-                        adv_exc=min(0.0, sl_price - entry_price),
-                    ))
+                        entry_price=entry_price, exit_price=tp1_price,
+                        fav_exc=fav, adv_exc=adv))
                     tp1_hit = True
                     bars_since_tp1 = 0
-                    peak_close_since_tp1 = c_close
                     adj_stop = sl_price if runner_stop_mode == "v1" \
                                else entry_price + entry_atr * 1.0
 
                 elif time_exit:
-                    # Time exit — both contracts
                     trades.append(_make_trade(
                         signal="TP1", exit_type="time",
                         entry_time=entry_time, exit_time=t,
                         entry_price=entry_price, exit_price=c_close,
-                        fav_exc=max(0.0, c_close - entry_price),
-                        adv_exc=min(0.0, c_close - entry_price),
-                    ))
+                        fav_exc=fav, adv_exc=adv))
                     trades.append(_make_trade(
                         signal="TP2", exit_type="time",
                         entry_time=entry_time, exit_time=t,
                         entry_price=entry_price, exit_price=c_close,
-                        fav_exc=max(0.0, c_close - entry_price),
-                        adv_exc=min(0.0, c_close - entry_price),
-                    ))
+                        fav_exc=fav, adv_exc=adv))
                     in_pos = False
 
             else:
-                # ─── TP1 already hit; second contract still open ───
+                # ─── TP1 already hit; second contract (runner) still open ───
                 bars_since_tp1 += 1
-                if peak_close_since_tp1 is not None:
-                    peak_close_since_tp1 = max(peak_close_since_tp1, c_close)
-
-                fav_exc_tp2 = (peak_close_since_tp1 - entry_price) if peak_close_since_tp1 else 0.0
+                hit_stop = (c_low  <= adj_stop)  if stop_trig == "intrabar" else (c_close <= adj_stop)
+                hit_tp2  = (c_high >= tp2_price) if tp_trig   == "intrabar" else (c_close >= tp2_price)
                 time_exit_2 = time_exit_bars > 0 and bars_since_tp1 >= time_exit_bars
 
-                if c_close <= adj_stop:
+                if hit_stop:
                     trades.append(_make_trade(
                         signal="TP2", exit_type="adj_stop",
                         entry_time=entry_time, exit_time=t,
-                        entry_price=entry_price, exit_price=c_close,
-                        fav_exc=fav_exc_tp2,
-                        adv_exc=min(0.0, c_close - entry_price),
-                    ))
+                        entry_price=entry_price, exit_price=adj_stop,
+                        fav_exc=fav, adv_exc=adv))
                     in_pos = False
 
-                elif c_close >= tp2_price:
+                elif hit_tp2:
                     trades.append(_make_trade(
                         signal="TP2", exit_type="tp2",
                         entry_time=entry_time, exit_time=t,
-                        entry_price=entry_price, exit_price=c_close,
-                        fav_exc=c_close - entry_price,
-                        adv_exc=min(0.0, adj_stop - entry_price),
-                    ))
+                        entry_price=entry_price, exit_price=tp2_price,
+                        fav_exc=fav, adv_exc=adv))
                     in_pos = False
 
                 elif time_exit_2:
@@ -577,9 +579,7 @@ def run_backtest(df: pd.DataFrame, config: dict) -> list[dict]:
                         signal="TP2", exit_type="time",
                         entry_time=entry_time, exit_time=t,
                         entry_price=entry_price, exit_price=c_close,
-                        fav_exc=fav_exc_tp2,
-                        adv_exc=min(0.0, c_close - entry_price),
-                    ))
+                        fav_exc=fav, adv_exc=adv))
                     in_pos = False
 
     return trades
