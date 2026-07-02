@@ -195,10 +195,12 @@ def fetch_bars(ticker: str, multiplier: int, timespan: str,
         return df
 
     if not MASSIVE_API_KEY:
-        print("\n\nERROR: MASSIVE_API_KEY is not set.")
-        print("Get your key at https://massive.com/dashboard and run:")
-        print("  export MASSIVE_API_KEY=your_key_here")
-        sys.exit(1)
+        # Raise instead of sys.exit — sys.exit inside the Streamlit app would
+        # kill the whole server process, not just this fetch.
+        raise RuntimeError(
+            "MASSIVE_API_KEY is not set. Get your key at "
+            "https://massive.com/dashboard and export MASSIVE_API_KEY=..."
+        )
 
     print(f"    fetching {ticker} {multiplier}{timespan}...", end="", flush=True)
 

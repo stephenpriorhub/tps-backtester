@@ -153,11 +153,40 @@ def build_stats_df(all_trades: dict) -> pd.DataFrame:
     return df
 
 
+def _partial_path(cfg: dict) -> Path:
+    """On-disk store for per-ticker results of an in-progress run."""
+    return RESULTS_DIR / f"partial_{_cfg_hash(cfg)}.pkl"
+
+
+def load_partial(cfg: dict) -> dict:
+    p = _partial_path(cfg)
+    if p.exists():
+        try:
+            with open(p, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return {}
+
+
 def run_backtest(tickers, cfg, progress_cb=None):
-    """Run engine on all tickers, return {ticker: df_trades} dict."""
-    all_trades = {}
+    """
+    Run engine on all tickers, return {ticker: df_trades} dict.
+
+    RESUMABLE: each ticker's result is persisted to disk the moment it
+    completes. If the run is interrupted (browser rerun, disconnect,
+    container restart), the next click resumes from the last finished
+    ticker instead of starting over.
+    """
+    all_trades = load_partial(cfg)
+    # Drop tickers not in this run's universe (cfg hash covers params, not order)
+    all_trades = {t: v for t, v in all_trades.items() if t in tickers}
     start, end = cfg["start_date"], cfg["end_date"]
+    partial_p = _partial_path(cfg)
+
     for i, ticker in enumerate(tickers):
+        if ticker in all_trades and all_trades[ticker] is not None:
+            continue  # already completed in a previous (interrupted) run
         if progress_cb:
             progress_cb(i, len(tickers), ticker)
         try:
@@ -168,10 +197,22 @@ def run_backtest(tickers, cfg, progress_cb=None):
                 continue
             _, df_trades = run_ticker(ticker, df_15m, df_daily, cfg)
             all_trades[ticker] = df_trades
-        except Exception as e:
+        except Exception:
             all_trades[ticker] = None
+        # Persist progress after EVERY ticker so an interruption loses ≤1 ticker
+        try:
+            with open(partial_p, "wb") as f:
+                pickle.dump(all_trades, f)
+        except Exception:
+            pass
+
     if progress_cb:
         progress_cb(len(tickers), len(tickers), "Done")
+    # Run finished — promote to the full results cache, clear the partial
+    try:
+        partial_p.unlink(missing_ok=True)
+    except Exception:
+        pass
     return all_trades
 
 
@@ -443,6 +484,12 @@ if run_btn:
             st.error("Set your Polygon/Massive API key in the sidebar first.")
             st.stop()
 
+        _already = [t for t, v in load_partial(cfg).items()
+                    if t in tickers and v is not None]
+        if _already:
+            st.toast(f"Resuming — {len(_already)}/{len(tickers)} tickers already "
+                     f"done ({', '.join(_already[:5])}…)", icon="⏯")
+
         progress_bar  = st.progress(0.0)
         status_text   = st.empty()
         ticker_log    = st.empty()
@@ -453,7 +500,8 @@ if run_btn:
             progress_bar.progress(pct)
             status_text.markdown(
                 f"**Running** {i}/{total} — `{label}` "
-                f"({pct*100:.0f}%)"
+                f"({pct*100:.0f}%) — progress is saved per ticker; "
+                f"if the run stops, click ▶ Run Backtest again to resume"
             )
 
         all_trades = run_backtest(tickers, cfg, _progress)
