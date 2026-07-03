@@ -221,9 +221,10 @@ def run_backtest(tickers, cfg, progress_cb=None):
 # Page config & CSS
 # ─────────────────────────────────────────────────────────────────────────────
 
+_OG_ICON = Path(__file__).parent / "og-icon.png"
 st.set_page_config(
     page_title="TPS Backtesting Dashboard",
-    page_icon="📈",
+    page_icon=str(_OG_ICON) if _OG_ICON.exists() else "📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
