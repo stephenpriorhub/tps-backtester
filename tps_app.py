@@ -1,8 +1,8 @@
 """
 TPS Backtesting Dashboard
 =========================
-Interactive Streamlit app for tuning and running the TPS Long Strategy v2.
-All compute runs locally — no Claude credits used.
+Interactive Streamlit app for tuning and running the TPS Long Strategy v3
+(RSI-momentum exit, 1-minute base data). All compute runs locally.
 
 Run:
     cd "/Users/stephenprior/Documents/GitHub/brain/Projects/TPS Project"
@@ -191,12 +191,12 @@ def run_backtest(tickers, cfg, progress_cb=None):
         if progress_cb:
             progress_cb(i, len(tickers), ticker)
         try:
-            df_15m   = fetch_bars(ticker, 15, "minute", start, end)
-            df_daily = fetch_bars(ticker, 1,  "day",   start, end)
-            if df_15m.empty or df_daily.empty:
+            df_1m    = fetch_bars(ticker, 1, "minute", start, end)
+            df_daily = fetch_bars(ticker, 1, "day",   start, end)
+            if df_1m.empty or df_daily.empty:
                 all_trades[ticker] = None
                 continue
-            _, df_trades = run_ticker(ticker, df_15m, df_daily, cfg)
+            _, df_trades = run_ticker(ticker, df_1m, df_daily, cfg)
             all_trades[ticker] = df_trades
         except Exception:
             all_trades[ticker] = None
@@ -325,26 +325,20 @@ with st.sidebar:
     wt_30  = c2.number_input("30m", 0.0, 30.0, float(DEFAULT_CONFIG["sqz_pts_30"]),  2.5)
     wt_15  = c3.number_input("15m", 0.0, 30.0, float(DEFAULT_CONFIG["sqz_pts_15"]),  2.5)
 
-    # ── Exits
+    # ── Exits (v3: hard stop + RSI momentum-exhaustion exit)
     st.subheader("📍 Exit Parameters")
+    st.caption("v3 exits: a single contract closes on either the hard stop or "
+               "an RSI momentum-exhaustion exit — no TP1/TP2 targets or trailing stop.")
     c1, c2, c3 = st.columns(3)
-    tp1_atr = c1.number_input("TP1 ATR", 0.5, 10.0, float(DEFAULT_CONFIG["tp1_atr"]), 0.5)
-    tp2_atr = c2.number_input("TP2 ATR", 0.5, 10.0, float(DEFAULT_CONFIG["tp2_atr"]), 0.5)
-    sl_atr  = c3.number_input("SL ATR",  0.5, 10.0, float(DEFAULT_CONFIG["sl_atr"]),  0.5)
-
-    runner_stop = st.selectbox(
-        "Runner stop after TP1",
-        ["Original stop (v1 baseline)", "Breakeven +1 ATR (v2)"],
-        index=0 if DEFAULT_CONFIG.get("runner_stop_mode", "v1") == "v1" else 1,
-        help="v1 keeps the -SL ATR stop on the second contract after TP1 fills "
-             "(matches the TradingView V1 backtest). v2 raises it to entry +1 ATR.")
-
-    time_exit_on = st.checkbox(
-        "Time exit", value=int(DEFAULT_CONFIG["time_exit_bars"]) > 0,
-        help="Off = trades only exit at TP1/TP2/stop (matches the V1 baseline)")
-    time_exit = st.number_input("Time-exit bars", 5, 500,
-                                 max(int(DEFAULT_CONFIG["time_exit_bars"]), 30),
-                                 disabled=not time_exit_on)
+    sl_atr   = c1.number_input("Hard Stop ATR", 0.5, 10.0,
+                               float(DEFAULT_CONFIG["sl_atr"]), 0.5,
+                               help="Hard stop = entry − (this × ATR at entry bar)")
+    rsi_exit = c2.number_input("RSI Exit Threshold", 30.0, 90.0,
+                               float(DEFAULT_CONFIG["rsi_exit_threshold"]), 1.0,
+                               help="Once in profit, exit the moment RSI drops below this")
+    rsi_len  = c3.number_input("RSI Length", 2, 50,
+                               int(DEFAULT_CONFIG["rsi_length"]),
+                               help="RSI period used for the momentum-exhaustion exit")
 
     # ── BB entry
     with st.expander("BB Entry (advanced)"):
@@ -419,11 +413,9 @@ cfg = {
     "sqz_pts_78":      wt_78,
     "sqz_pts_30":      wt_30,
     "sqz_pts_15":      wt_15,
-    "tp1_atr":         tp1_atr,
-    "tp2_atr":         tp2_atr,
     "sl_atr":          sl_atr,
-    "runner_stop_mode": "v1" if runner_stop.startswith("Original") else "be+1",
-    "time_exit_bars":  time_exit if time_exit_on else 0,
+    "rsi_exit_threshold": rsi_exit,
+    "rsi_length":      rsi_len,
     "bb_len":          bb_len,
     "bb_dev":          bb_dev,
     "sqz_len":         sqz_len,
@@ -441,10 +433,10 @@ if "saved_test_meta"   not in st.session_state: st.session_state.saved_test_meta
 # Header
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("📈 TPS Long Strategy v2 — Backtesting Dashboard")
+st.title("📈 TPS Long Strategy v3 — Backtesting Dashboard")
 cfg_label = (f"{len(tickers)} tickers  ·  {chart_tf}m  ·  "
              f"Score≥{score_thr:.0f}  ·  "
-             f"TP1={tp1_atr}×ATR  TP2={tp2_atr}×ATR  SL={sl_atr}×ATR  ·  "
+             f"Stop={sl_atr}×ATR  RSI<{rsi_exit:.0f} exit  ·  "
              f"{start_date} → {end_date}")
 st.caption(cfg_label)
 
@@ -622,7 +614,7 @@ with tabs[0]:
         hide_index=True,
     )
     st.caption(
-        "Per-signal stats (both TP legs averaged) — identical to the exported "
+        "Per-signal stats (one exit per trade) — identical to the exported "
         "workbook's Summary tab. Totals: "
         f"**{int(active['n'].sum())} trades**, "
         f"**{active['wr'].mean()*100:.1f}%** win rate, "
@@ -673,8 +665,14 @@ with tabs[1]:
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Return distribution
-        if all_exits_list:
+        # Return distribution — pool every ticker's exit rows
+        _exit_frames = [
+            df[df["Type"] == "Exit long"]
+            for df in results.values()
+            if df is not None and not df.empty
+        ]
+        all_exits = pd.concat(_exit_frames, ignore_index=True) if _exit_frames else pd.DataFrame()
+        if not all_exits.empty:
             fig3 = px.histogram(
                 all_exits, x="Net P&L %", nbins=80,
                 color_discrete_sequence=["#4fc3f7"],
@@ -710,6 +708,9 @@ with tabs[2]:
                 f"Avg Win {s_t['avg_win']*100:+.3f}%  |  Avg Loss {s_t['avg_loss']*100:+.3f}%"
             )
 
+            exits_t = df_t[df_t["Type"] == "Exit long"].reset_index(drop=True)
+            pnl_t = exits_t["Net P&L %"]
+
             # Equity curve
             cum = (1 + pnl_t / 100).cumprod() - 1
             fig_eq = go.Figure()
@@ -722,7 +723,7 @@ with tabs[2]:
             fig_eq.update_layout(
                 plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
                 font_color="white", height=220,
-                title=f"{sel_ticker} — cumulative return (TP2 leg exits)",
+                title=f"{sel_ticker} — cumulative return (per-signal exits)",
                 xaxis_title="Trade #", yaxis_title="Cumulative %",
                 margin=dict(t=40, b=30),
             )
@@ -779,10 +780,10 @@ if has_baseline and len(tabs) == 4:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("WR change",      f"{cur_wr:.1f}%",  f"{cur_wr-base_wr:+.2f} pp")
         c2.metric("Avg Ret change", f"{cur_agg:.3f}%", f"{cur_agg-base_agg:+.3f}%")
-        c3.metric("Current config", f"Score≥{score_thr:.0f} TP2={tp2_atr}×ATR")
+        c3.metric("Current config", f"Score≥{score_thr:.0f} RSI<{rsi_exit:.0f}")
         c4.metric("Baseline config",
                   f"Score≥{baseline['cfg']['score_threshold']:.0f} "
-                  f"TP2={baseline['cfg']['tp2_atr']}×ATR")
+                  f"RSI<{baseline['cfg'].get('rsi_exit_threshold', 60):.0f}")
 
         st.markdown("**Per-ticker delta** (current − baseline):")
         st.dataframe(

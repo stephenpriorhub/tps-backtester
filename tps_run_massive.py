@@ -1,8 +1,9 @@
 """
-TPS Long Strategy v2 — Backtester powered by Massive Market Data
+TPS Long Strategy v3 — Backtester powered by Massive Market Data
 =================================================================
-Fetches OHLCV data from Massive, runs the TPS backtest engine, and
-exports results to an Excel spreadsheet matching the existing TV format.
+Fetches 1-MINUTE OHLCV data from Massive, runs the TPS v3 backtest engine
+(RSI-momentum exit), and exports results to an Excel spreadsheet matching the
+TradingView list-of-trades format.
 
 QUICK START:
   1. Get your Massive API key from https://massive.com/dashboard
@@ -143,8 +144,8 @@ CONFIG = {
 
 # ── To test an improvement idea, uncomment ONE block:
 
-# IDEA 1 — TP2 at +4 ATR (wider target)
-# CONFIG["tp2_atr"] = 4.0
+# IDEA 1 — Looser RSI exit (let winners run further)
+# CONFIG["rsi_exit_threshold"] = 50.0
 
 # IDEA 2 — Score threshold raised to 70
 # CONFIG["score_threshold"] = 70.0
@@ -429,7 +430,7 @@ def main():
     n_total   = len(tickers)
 
     print("=" * 65)
-    print(f"  TPS Long Strategy v2 — Massive Market Data Backtest")
+    print(f"  TPS Long Strategy v3 — Massive Market Data Backtest")
     print(f"  Universe : {n_total} tickers")
     print(f"  Period   : {start} → {end}")
     print(f"  Chart TF : {chart_tf}m    Score ≥ {CONFIG['score_threshold']}")
@@ -453,20 +454,20 @@ def main():
         print(f"\n[{i:>3}/{n_total}] {ticker}{eta_str}")
 
         try:
-            df_15m   = fetch_bars(ticker, 15, "minute", start, end)
-            df_daily = fetch_bars(ticker, 1,  "day",    start, end)
+            df_1m    = fetch_bars(ticker, 1, "minute", start, end)
+            df_daily = fetch_bars(ticker, 1, "day",    start, end)
         except Exception as e:
             print(f"    ⚠ fetch error: {e} — skipping")
             skipped.append(ticker)
             continue
 
-        if df_15m.empty or df_daily.empty:
+        if df_1m.empty or df_daily.empty:
             print(f"    ⚠ no data — skipping")
             skipped.append(ticker)
             continue
 
         try:
-            raw_trades, df_trades = run_ticker(ticker, df_15m, df_daily, CONFIG)
+            raw_trades, df_trades = run_ticker(ticker, df_1m, df_daily, CONFIG)
         except Exception as e:
             print(f"    ⚠ engine error: {e} — skipping")
             skipped.append(ticker)
@@ -484,14 +485,14 @@ def main():
         elapsed = time.time() - t0
         times.append(elapsed)
         tag = "✓" if n_exits else "–"
-        print(f"    {tag} {n_exits//2} signals  WR {wr:.1f}%  avg {avg_r:+.3f}%  [{elapsed:.1f}s]")
+        print(f"    {tag} {n_exits} signals  WR {wr:.1f}%  avg {avg_r:+.3f}%  [{elapsed:.1f}s]")
 
         all_trades[ticker] = df_trades
 
         # Rate-limit courtesy between tickers (only when we had to fetch)
         was_cached = all(
             _cache_path(ticker, m, ts, start, end).exists()
-            for m, ts in [(15, "minute"), (1, "day")]
+            for m, ts in [(1, "minute"), (1, "day")]
         )
         if not was_cached:
             time.sleep(TICKER_SLEEP)
@@ -515,7 +516,7 @@ def main():
         wr    = wins / n * 100 if n else 0
         avg_r = all_exits["Net P&L %"].mean() if n else 0
         print(f"\n  ── NDX100 Aggregate ──")
-        print(f"  Total exits  : {n:,}  ({n//2} signals × 2 legs)")
+        print(f"  Total signals: {n:,}")
         print(f"  Win rate     : {wr:.1f}%")
         print(f"  Avg return   : {avg_r:+.3f}%")
         print(f"  Avg win      : {all_exits.loc[all_exits['Net P&L %'] > 0, 'Net P&L %'].mean():+.3f}%")
